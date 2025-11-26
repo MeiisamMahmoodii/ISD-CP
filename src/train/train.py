@@ -34,14 +34,33 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
     
     # 1. Data
-    # Load dataset from the specified directory
-    dataset = CausalDataset(args.data_dir)
+    # Use OnlineCausalDataset for infinite/large-scale data without storage
+    # num_samples defines how many SCMs constitute "one epoch"
+    # For 100k SCMs, we can set num_samples=1000 and run for 100 epochs, or num_samples=100000 for 1 epoch.
+    # Let's set it to 1000 SCMs per epoch for frequent logging/checkpointing.
+    
+    from src.data.dataset import OnlineCausalDataset
+    
+    # Train set: Generates new SCMs every time
+    dataset = OnlineCausalDataset(
+        num_samples=1000, # 1000 SCMs per epoch
+        num_vars=args.num_vars,
+        seed=42
+    )
+    
+    # Validation set: Should ideally be fixed or use a different seed range
+    # We use a smaller fixed set for validation (generated on fly but deterministic)
+    val_dataset = OnlineCausalDataset(
+        num_samples=50, 
+        num_vars=args.num_vars,
+        seed=12345 # Different seed
+    )
     
     # Initialize DataLoaders
-    # We use batch_size=1 because our dataset returns "chunks" (lists of batches)
-    # The Trainer handles iterating through these chunks.
-    train_loader = DataLoader(dataset, batch_size=1, shuffle=True, collate_fn=collate_fn)
-    val_loader = DataLoader(dataset, batch_size=1, shuffle=False, collate_fn=collate_fn)
+    # num_workers is CRITICAL here. The CPU generates data while GPU trains.
+    # set num_workers > 0 (e.g., 4 or 8) to parallelize generation.
+    train_loader = DataLoader(dataset, batch_size=1, shuffle=True, collate_fn=collate_fn, num_workers=4)
+    val_loader = DataLoader(val_dataset, batch_size=1, shuffle=False, collate_fn=collate_fn, num_workers=2)
     
     # 2. Model
     # Initialize the Causal Transformer

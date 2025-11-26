@@ -57,3 +57,97 @@ def collate_fn(batch):
     handles the iteration.
     """
     return torch.utils.data.dataloader.default_collate(batch)
+
+class OnlineCausalDataset(Dataset):
+    """
+    Dataset that generates SCM data on-the-fly.
+    
+    Eliminates the need for storing terabytes of data.
+    Each 'item' in this dataset is a full SCM's worth of data (a list of batches).
+    
+    Attributes:
+        num_samples (int): Virtual length of the dataset (number of SCMs to generate per epoch).
+        num_vars (int): Number of variables per SCM.
+        n_base (int): Number of baseline samples.
+        n_int_samples (int): Number of samples per intervention.
+        intervention_fraction (float): Fraction of nodes to intervene on.
+    """
+    def __init__(
+        self, 
+        num_samples: int,
+        num_vars: int = 16,
+        n_base: int = 1000,
+        n_int_samples: int = 100,
+        intervention_fraction: float = 0.2,
+        seed: int = 42
+    ):
+        self.num_samples = num_samples
+        self.num_vars = num_vars
+        self.n_base = n_base
+        self.n_int_samples = n_int_samples
+        self.intervention_fraction = intervention_fraction
+        self.seed = seed
+
+    def __len__(self):
+        return self.num_samples
+
+    def __getitem__(self, idx):
+        """
+        Generates a fresh SCM and its data.
+        """
+        # Use idx to seed so it's deterministic per epoch if needed, 
+        # or use random seed if we want infinite variation.
+        # For reproducibility, we combine base seed + idx.
+        # Note: In multi-worker setup, we might need worker_init_fn to avoid duplicates.
+        
+        # Import here to avoid circular imports if any (though unlikely given structure)
+        from src.data.scm_generator import SCMGenerator
+        from src.data.sampler import DataSampler
+        from src.data.processor import DataProcessor
+        
+        # 1. Create SCM
+        # We add a large offset to seed to avoid overlap with validation seeds if any
+        current_seed = self.seed + idx
+        scm = SCMGenerator(num_vars=self.num_vars, seed=current_seed)
+        sampler = DataSampler(scm)
+        processor = DataProcessor()
+        
+        # 2. Generate Baseline
+        baseline_data = sampler.sample_baseline(self.n_base)
+        processor.fit(baseline_data)
+        
+        # 3. Generate Interventions
+        intervention_vals = [-5.0, -2.0, 0.0, 2.0, 5.0]
+        num_int_nodes = max(1, int(self.num_vars * self.intervention_fraction))
+        int_nodes = torch.randperm(self.num_vars)[:num_int_nodes].tolist()
+        
+        interventions = sampler.sample_interventions(
+            n_samples=self.n_int_samples,
+            intervention_nodes=int_nodes,
+            intervention_values=intervention_vals
+        )
+        
+        # 4. Process
+        processed_data = []
+        for item in interventions:
+            int_data = item['data']
+            mask = item['mask']
+            value = item['value']
+            node_idx = item['node_idx']
+            
+            # Pair with random baseline samples
+            base_indices = torch.randint(0, len(baseline_data), (len(int_data),))
+            base_batch = baseline_data[base_indices]
+            
+            inp = processor.prepare_input(base_batch, mask, value, node_idx)
+            target = processor.transform(int_data)
+            
+            batch_data = {
+                'x': inp['x'],
+                'mask': inp['mask'],
+                'value': inp['value'],
+                'target': target
+            }
+            processed_data.append(batch_data)
+            
+        return processed_data
