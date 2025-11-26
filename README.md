@@ -61,8 +61,8 @@ graph TD
         MLP --> Out[Predicted Post-Intervention State]
     end
 
-    Input Processing --> Transformer Core
-    Transformer Core --> Prediction Head
+    Pos --> L1
+    LN_Final --> MLP
 ```
 
 ### Key Components
