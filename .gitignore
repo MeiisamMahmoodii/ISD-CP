@@ -19,3 +19,10 @@ Thumbs.db
 # Sensitive/Local Config (CRITICAL: Do not commit these)
 *.env
 config.local.js
+
+# Test Artifacts and Checkpoints
+checkpoints_*/
+test_*/
+__pycache__/
+*.pyc
+*.tfevents.*

@@ -45,6 +45,7 @@ def main():
         num_samples=args.num_scms, # 100 SCMs per epoch
         min_vars=args.min_vars,
         max_vars=args.max_vars, # Actual SCM size will be random in [min, max]
+        n_int_samples=args.batch_size,
         seed=42
     )
     

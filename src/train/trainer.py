@@ -46,7 +46,8 @@ class Trainer:
                  file_content = batch[0]
             
             # Iterate over the mini-batches contained in the loaded file/chunk
-            for mini_batch in file_content:
+            inner_pbar = tqdm(file_content, desc="Processing SCM", leave=False)
+            for mini_batch in inner_pbar:
                 x = mini_batch['x'].to(self.device)
                 mask = mini_batch['mask'].to(self.device)
                 value = mini_batch['value'].to(self.device)
