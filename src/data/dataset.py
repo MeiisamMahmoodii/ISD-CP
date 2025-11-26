@@ -2,6 +2,7 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 import glob
 import os
+import numpy as np
 
 class CausalDataset(Dataset):
     """
