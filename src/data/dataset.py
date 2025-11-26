@@ -67,7 +67,8 @@ class OnlineCausalDataset(Dataset):
     
     Attributes:
         num_samples (int): Virtual length of the dataset (number of SCMs to generate per epoch).
-        num_vars (int): Number of variables per SCM.
+        min_vars (int): Minimum number of variables per SCM.
+        max_vars (int): Maximum number of variables per SCM.
         n_base (int): Number of baseline samples.
         n_int_samples (int): Number of samples per intervention.
         intervention_fraction (float): Fraction of nodes to intervene on.
@@ -75,14 +76,16 @@ class OnlineCausalDataset(Dataset):
     def __init__(
         self, 
         num_samples: int,
-        num_vars: int = 16,
+        min_vars: int = 10,
+        max_vars: int = 100,
         n_base: int = 1000,
         n_int_samples: int = 100,
         intervention_fraction: float = 0.2,
         seed: int = 42
     ):
         self.num_samples = num_samples
-        self.num_vars = num_vars
+        self.min_vars = min_vars
+        self.max_vars = max_vars
         self.n_base = n_base
         self.n_int_samples = n_int_samples
         self.intervention_fraction = intervention_fraction
@@ -104,28 +107,39 @@ class OnlineCausalDataset(Dataset):
         from src.data.scm_generator import SCMGenerator
         from src.data.sampler import DataSampler
         from src.data.processor import DataProcessor
+        import networkx as nx
         
-        # 1. Create SCM
+        # 1. Determine num_vars for this SCM
+        # We use the seed to deterministically pick num_vars
+        rng = np.random.RandomState(self.seed + idx)
+        current_num_vars = rng.randint(self.min_vars, self.max_vars + 1)
+        
+        # 2. Create SCM
         # We add a large offset to seed to avoid overlap with validation seeds if any
         current_seed = self.seed + idx
-        scm = SCMGenerator(num_vars=self.num_vars, seed=current_seed)
+        scm = SCMGenerator(num_vars=current_num_vars, seed=current_seed)
         sampler = DataSampler(scm)
         processor = DataProcessor()
         
-        # 2. Generate Baseline
+        # 3. Generate Baseline
         baseline_data = sampler.sample_baseline(self.n_base)
         processor.fit(baseline_data)
         
-        # 3. Generate Interventions
+        # 4. Generate Interventions
         intervention_vals = [-5.0, -2.0, 0.0, 2.0, 5.0]
-        num_int_nodes = max(1, int(self.num_vars * self.intervention_fraction))
-        int_nodes = torch.randperm(self.num_vars)[:num_int_nodes].tolist()
+        num_int_nodes = max(1, int(current_num_vars * self.intervention_fraction))
+        int_nodes = torch.randperm(current_num_vars)[:num_int_nodes].tolist()
         
         interventions = sampler.sample_interventions(
             n_samples=self.n_int_samples,
             intervention_nodes=int_nodes,
             intervention_values=intervention_vals
         )
+        
+        # Get Adjacency Matrix (Ground Truth)
+        # nx.to_numpy_array returns float, convert to int binary
+        adj = nx.to_numpy_array(scm.dag, weight=None)
+        adj = torch.tensor(adj, dtype=torch.float32)
         
         # 4. Process
         processed_data = []
@@ -146,7 +160,8 @@ class OnlineCausalDataset(Dataset):
                 'x': inp['x'],
                 'mask': inp['mask'],
                 'value': inp['value'],
-                'target': target
+                'target': target,
+                'adj': adj # Add ground truth adjacency
             }
             processed_data.append(batch_data)
             

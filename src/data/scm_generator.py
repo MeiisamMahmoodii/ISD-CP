@@ -66,7 +66,11 @@ class SCMGenerator:
         # We use a lower triangular matrix approach or standard random graph + acyclic check.
         # Here we use networkx's gnp_random_graph and enforce direction u < v to guarantee acyclicity.
         G = nx.gnp_random_graph(self.num_vars, self.edge_prob, directed=True, seed=self.seed)
-        self.dag = nx.DiGraph([(u, v) for (u, v) in G.edges() if u < v])
+        
+        # Create DAG explicitly with all nodes to ensure isolated nodes are included
+        self.dag = nx.DiGraph()
+        self.dag.add_nodes_from(range(self.num_vars))
+        self.dag.add_edges_from([(u, v) for (u, v) in G.edges() if u < v])
         
         # Ensure the graph is valid and we have a topological sort
         self.topological_order = list(nx.topological_sort(self.dag))
