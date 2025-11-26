@@ -4,3 +4,4 @@ networkx
 scikit-learn
 tqdm
 tensorboard
+matplotlib

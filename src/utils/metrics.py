@@ -63,3 +63,26 @@ def extract_attention_dag(model, x, mask, value, threshold=0.1):
     np.fill_diagonal(adj, 0) # Remove self-loops
     
     return adj
+
+import matplotlib.pyplot as plt
+
+def plot_adjacency_heatmap(pred_adj: np.ndarray, true_adj: np.ndarray):
+    """
+    Plots the Predicted and True adjacency matrices side-by-side.
+    """
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+    
+    # Predicted
+    axes[0].imshow(pred_adj, cmap='Blues', vmin=0, vmax=1)
+    axes[0].set_title("Predicted DAG")
+    axes[0].set_xlabel("Effect")
+    axes[0].set_ylabel("Cause")
+    
+    # True
+    axes[1].imshow(true_adj, cmap='Greens', vmin=0, vmax=1)
+    axes[1].set_title("True DAG")
+    axes[1].set_xlabel("Effect")
+    axes[1].set_ylabel("Cause")
+    
+    plt.tight_layout()
+    return fig

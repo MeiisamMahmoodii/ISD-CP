@@ -4,7 +4,8 @@ import torch.optim as optim
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 import numpy as np
-from src.utils.metrics import compute_shd, compute_f1, extract_attention_dag
+from src.utils.metrics import compute_shd, compute_f1, extract_attention_dag, plot_adjacency_heatmap
+import matplotlib.pyplot as plt
 
 class Trainer:
     """
@@ -76,7 +77,7 @@ class Trainer:
                 
                 # Log batch loss occasionally
                 if self.global_step % 10 == 0:
-                    self.writer.add_scalar("Train/BatchLoss", loss.item(), self.global_step)
+                    self.writer.add_scalar("Loss/TrainBatch", loss.item(), self.global_step)
                 
                 pbar.set_postfix({'loss': loss.item()})
         
@@ -84,7 +85,7 @@ class Trainer:
             self.scheduler.step()
             
         avg_loss = total_loss / len(self.train_loader)
-        self.writer.add_scalar("Train/EpochLoss", avg_loss, epoch_idx)
+        self.writer.add_scalar("Loss/TrainEpoch", avg_loss, epoch_idx)
         return avg_loss
 
     def validate(self, epoch_idx):
@@ -156,14 +157,20 @@ class Trainer:
                             total_shd += shd
                             total_f1 += f1
                             num_graphs += 1
+                            
+                            # Log Heatmap
+                            fig = plot_adjacency_heatmap(pred_adj, true_adj)
+                            self.writer.add_figure("Val/Adjacency", fig, epoch_idx)
+                            plt.close(fig)
+                            
                         first_batch = False
                     
         avg_loss = total_loss / len(self.val_loader)
         avg_shd = total_shd / max(1, num_graphs)
         avg_f1 = total_f1 / max(1, num_graphs)
         
-        self.writer.add_scalar("Val/Loss", avg_loss, epoch_idx)
-        self.writer.add_scalar("Val/SHD", avg_shd, epoch_idx)
-        self.writer.add_scalar("Val/F1", avg_f1, epoch_idx)
+        self.writer.add_scalar("Loss/Val", avg_loss, epoch_idx)
+        self.writer.add_scalar("Metrics/SHD", avg_shd, epoch_idx)
+        self.writer.add_scalar("Metrics/F1", avg_f1, epoch_idx)
         
         return avg_loss, avg_shd, avg_f1
