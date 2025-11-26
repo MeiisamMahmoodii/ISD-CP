@@ -19,7 +19,9 @@ class Trainer:
         optimizer: optim.Optimizer,
         device: str = "cuda" if torch.cuda.is_available() else "cpu",
         scheduler = None,
-        log_dir: str = "logs"
+        log_dir: str = "logs",
+        accumulation_steps: int = 1,
+        micro_batch_size: int = 20 # Default safe size
     ):
         self.model = model.to(device)
         self.train_loader = train_loader
@@ -27,6 +29,8 @@ class Trainer:
         self.optimizer = optimizer
         self.scheduler = scheduler
         self.device = device
+        self.accumulation_steps = accumulation_steps
+        self.micro_batch_size = micro_batch_size
         self.criterion = nn.MSELoss()
         self.writer = SummaryWriter(log_dir=log_dir)
         self.global_step = 0
@@ -60,27 +64,63 @@ class Trainer:
                     value = value.squeeze(0)
                     target = target.squeeze(0)
                 
-                # Zero gradients
+                # Micro-batching to avoid OOM
+                batch_size = x.shape[0]
+                num_micro_batches = (batch_size + self.micro_batch_size - 1) // self.micro_batch_size
+                
+                batch_loss = 0.0
+                
                 self.optimizer.zero_grad()
                 
-                # Forward pass
-                pred = self.model(x, mask, value)
+                for i in range(num_micro_batches):
+                    start_idx = i * self.micro_batch_size
+                    end_idx = min((i + 1) * self.micro_batch_size, batch_size)
+                    
+                    x_micro = x[start_idx:end_idx]
+                    mask_micro = mask[start_idx:end_idx]
+                    value_micro = value[start_idx:end_idx]
+                    target_micro = target[start_idx:end_idx]
+                    
+                    # Forward pass
+                    pred_micro = self.model(x_micro, mask_micro, value_micro)
+                    
+                    # Compute Loss
+                    loss_micro = self.criterion(pred_micro, target_micro)
+                    
+                    # Normalize loss for micro-batches AND accumulation steps
+                    # We want the gradients to average out over the full batch
+                    # loss.backward() accumulates gradients.
+                    # If we split batch into N chunks, we should divide loss by N?
+                    # Yes, because sum(gradients) should be equivalent to full batch gradient.
+                    # Full batch loss = mean(per_sample_loss).
+                    # Micro batch loss = mean(per_sample_loss_micro).
+                    # We want to optimize for Full Batch Loss.
+                    # Gradients from micro batch are d(Mean_Micro)/dw.
+                    # We want d(Mean_Full)/dw = sum(d(Mean_Micro)/dw * (N_micro / N_total))
+                    # So we weight by micro_batch_size / total_batch_size.
+                    
+                    weight = (end_idx - start_idx) / batch_size
+                    loss_scaled = loss_micro * weight / self.accumulation_steps
+                    
+                    loss_scaled.backward()
+                    
+                    batch_loss += loss_micro.item() * weight
                 
-                # Compute Loss (MSE)
-                loss = self.criterion(pred, target)
+                # Optimization step (Gradient Accumulation across logical batches)
+                if (self.global_step + 1) % self.accumulation_steps == 0:
+                    self.optimizer.step()
+                    self.optimizer.zero_grad()
                 
-                # Backward pass and optimization
-                loss.backward()
-                self.optimizer.step()
-                
-                total_loss += loss.item()
+                total_loss += batch_loss
                 self.global_step += 1
                 
                 # Log batch loss occasionally
                 if self.global_step % 10 == 0:
-                    self.writer.add_scalar("Loss/TrainBatch", loss.item(), self.global_step)
+                    self.writer.add_scalar("Loss/TrainBatch", batch_loss, self.global_step)
+                    # Log progress text
+                    self.writer.add_text("Status", f"Epoch {epoch_idx}: Step {self.global_step}, Loss: {batch_loss:.4f}", self.global_step)
                 
-                pbar.set_postfix({'loss': loss.item()})
+                pbar.set_postfix({'loss': batch_loss})
         
         if self.scheduler:
             self.scheduler.step()

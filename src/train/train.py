@@ -31,9 +31,22 @@ def main():
     parser.add_argument("--num_scms", type=int, default=100, help="Number of SCMs per epoch")
     parser.add_argument("--d_model", type=int, default=256, help="Transformer embedding dimension")
     parser.add_argument("--num_layers", type=int, default=8, help="Number of transformer layers")
+    parser.add_argument("--accumulation_steps", type=int, default=1, help="Gradient accumulation steps")
+    parser.add_argument("--micro_batch_size", type=int, default=20, help="Micro batch size to avoid OOM")
+    parser.add_argument("--no_tensorboard", action="store_true", help="Disable auto-launch of TensorBoard")
     args = parser.parse_args()
     
     os.makedirs(args.output_dir, exist_ok=True)
+
+    # Launch TensorBoard
+    if not args.no_tensorboard:
+        import subprocess
+        import time
+        print("Launching TensorBoard...")
+        tb_log_dir = os.path.join(args.output_dir, "logs")
+        # Run in background
+        subprocess.Popen(["tensorboard", "--logdir", tb_log_dir, "--port", "6006"])
+        time.sleep(2) # Give it a sec
     
     # 1. Data
     # Use OnlineCausalDataset for infinite/large-scale data without storage
@@ -85,7 +98,9 @@ def main():
         val_loader=val_loader,
         optimizer=optimizer,
         device="cuda" if torch.cuda.is_available() else "cpu",
-        log_dir=os.path.join(args.output_dir, "logs")
+        log_dir=os.path.join(args.output_dir, "logs"),
+        accumulation_steps=args.accumulation_steps,
+        micro_batch_size=args.micro_batch_size
     )
     
     # 5. Loop
