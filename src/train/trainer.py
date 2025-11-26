@@ -5,6 +5,8 @@ from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 import numpy as np
 from src.utils.metrics import compute_shd, compute_f1, extract_attention_dag, plot_adjacency_heatmap
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
 class Trainer:

@@ -90,7 +90,13 @@ class OnlineCausalDataset(Dataset):
         self.n_base = n_base
         self.n_int_samples = n_int_samples
         self.intervention_fraction = intervention_fraction
+        self.intervention_fraction = intervention_fraction
         self.seed = seed
+        self.epoch_offset = 0
+
+    def set_epoch(self, epoch: int):
+        """Updates the epoch offset to ensure new data generation."""
+        self.epoch_offset = epoch * self.num_samples
 
     def __len__(self):
         return self.num_samples
@@ -112,12 +118,13 @@ class OnlineCausalDataset(Dataset):
         
         # 1. Determine num_vars for this SCM
         # We use the seed to deterministically pick num_vars
-        rng = np.random.RandomState(self.seed + idx)
+        # Combine base seed + epoch_offset + idx
+        current_seed = self.seed + self.epoch_offset + idx
+        rng = np.random.RandomState(current_seed)
         current_num_vars = rng.randint(self.min_vars, self.max_vars + 1)
         
         # 2. Create SCM
         # We add a large offset to seed to avoid overlap with validation seeds if any
-        current_seed = self.seed + idx
         scm = SCMGenerator(num_vars=current_num_vars, seed=current_seed)
         sampler = DataSampler(scm)
         processor = DataProcessor()

@@ -6,6 +6,18 @@ from src.model.transformer import CausalTransformer
 from src.train.trainer import Trainer
 from src.utils.monitor import log_gpu_usage
 import os
+import logging
+import sys
+
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+logger = logging.getLogger(__name__)
 
 def main():
     """
@@ -37,12 +49,19 @@ def main():
     args = parser.parse_args()
     
     os.makedirs(args.output_dir, exist_ok=True)
+    
+    # Add file handler to logger
+    file_handler = logging.FileHandler(os.path.join(args.output_dir, "train.log"))
+    file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+    logger.addHandler(file_handler)
+    # Add to root logger so Trainer can use it too if it uses logging
+    logging.getLogger().addHandler(file_handler)
 
     # Launch TensorBoard
     if not args.no_tensorboard:
         import subprocess
         import time
-        print("Launching TensorBoard...")
+        logger.info("Launching TensorBoard...")
         tb_log_dir = os.path.join(args.output_dir, "logs")
         # Run in background
         subprocess.Popen(["tensorboard", "--logdir", tb_log_dir, "--port", "6006"])
@@ -104,16 +123,20 @@ def main():
     )
     
     # 5. Loop
-    print(f"Starting training on {trainer.device}...")
+    logger.info(f"Starting training on {trainer.device}...")
     log_gpu_usage()
     
     for epoch in range(args.epochs):
+        # Update dataset epoch to generate new SCMs
+        dataset.set_epoch(epoch)
+        
         loss = trainer.train_epoch(epoch)
         val_loss, val_shd, val_f1 = trainer.validate(epoch)
-        print(f"Epoch {epoch+1}/{args.epochs} - Train Loss: {loss:.4f} - Val Loss: {val_loss:.4f} - SHD: {val_shd:.2f} - F1: {val_f1:.4f}")
+        logger.info(f"Epoch {epoch+1}/{args.epochs} - Train Loss: {loss:.4f} - Val Loss: {val_loss:.4f} - SHD: {val_shd:.2f} - F1: {val_f1:.4f}")
         
         # Save checkpoint
         torch.save(model.state_dict(), os.path.join(args.output_dir, f"model_epoch_{epoch+1}.pt"))
+        logger.info(f"Saved checkpoint: model_epoch_{epoch+1}.pt")
 
 if __name__ == "__main__":
     main()
