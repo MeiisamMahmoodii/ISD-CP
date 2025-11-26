@@ -1,0 +1,21 @@
+# Dependency Directories
+/.venv
+/data
+/venv
+
+# Compiled/Runtime Files
+*.log
+*.tmp
+*.class
+/dist/
+/build/
+*.pt
+*.pth   
+
+# Operating System Files
+.DS_Store
+Thumbs.db
+
+# Sensitive/Local Config (CRITICAL: Do not commit these)
+*.env
+config.local.js
