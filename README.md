@@ -14,7 +14,16 @@ Unlike traditional Causal Bayesian Networks that rely on explicit, often brittle
 ### Why ISD-CP?
 *   **Structure-Agnostic**: No need for prior knowledge of the causal graph.
 *   **Infinite Scalability**: Trained on an infinite stream of synthetic Structural Causal Models (SCMs) generated on-the-fly.
+*   **Structure-Agnostic**: No need for prior knowledge of the causal graph.
+*   **Infinite Scalability**: Trained on an infinite stream of synthetic Structural Causal Models (SCMs) generated on-the-fly.
 *   **Zero-Shot Generalization**: Capable of predicting interventions on unseen causal systems immediately.
+
+## 🚀 Recent Updates & Improvements
+*   **Infinite Data Generation**: The model now sees unique, randomly generated SCMs in every epoch, preventing overfitting and ensuring true generalization.
+*   **Micro-Batching**: Implemented gradient accumulation with micro-batches to support large effective batch sizes on limited GPU memory (fixing OOM errors).
+*   **Structural Guidance**: Added an auxiliary loss term (`lambda_aux`) that supervises the attention weights with the ground-truth adjacency matrix, accelerating structure learning.
+*   **Stability**: Integrated Gradient Clipping and Cosine Annealing Warm Restarts scheduler for stable, robust training.
+*   **Observability**: Enhanced TensorBoard integration with auto-launch, text status logging, and file-based logging (`train.log`).
 
 ---
 
@@ -68,7 +77,8 @@ graph TD
 ### Key Components
 1.  **TabPFN-Style Embeddings**: Maps scalar values to high-dimensional vectors using learned prototypes.
 2.  **Masked Attention**: Ensures the model respects the intervention (e.g., the intervened variable $X_k$ is fixed).
-3.  **Implicit DAG Extraction**: Attention weights $\mathbf{A}$ in the final layers approximate the adjacency matrix of the underlying causal graph.
+2.  **Masked Attention**: Ensures the model respects the intervention (e.g., the intervened variable $X_k$ is fixed).
+3.  **Implicit DAG Extraction**: Attention weights $\mathbf{A}$ in the final layers approximate the adjacency matrix of the underlying causal graph. This is now explicitly supervised via an auxiliary loss.
 
 ---
 
@@ -130,7 +140,13 @@ python -m src.train.train --output_dir checkpoints_prod --num_scms 1000 --epochs
 | `--batch_size` | 100 | Samples per update step. |
 | `--min_vars` | 10 | Minimum number of variables in a generated SCM. |
 | `--max_vars` | 1000 | Maximum number of variables (dynamic scaling). |
+| `--min_vars` | 10 | Minimum number of variables in a generated SCM. |
+| `--max_vars` | 1000 | Maximum number of variables (dynamic scaling). |
 | `--lr` | 1e-4 | Learning rate. |
+| `--accumulation_steps` | 1 | Gradient accumulation steps. |
+| `--micro_batch_size` | 20 | Micro-batch size to prevent OOM. |
+| `--lambda_aux` | 0.1 | Weight for auxiliary attention loss (structure learning). |
+| `--grad_clip` | 1.0 | Gradient clipping norm. |
 
 ### Monitoring
 We provide rich logging via TensorBoard. Track Loss, Structural Hamming Distance (SHD), and F1 Scores in real-time.
@@ -175,7 +191,16 @@ ISD-CP/
 *   🚀 **Online Data Generation**: Moved from disk to RAM, enabling infinite data.
 *   📈 **Dynamic Scaling**: Support for 10-1000 variables per SCM.
 *   🔍 **Attention Extraction**: Implicit DAG discovery via attention weights.
+*   🚀 **Online Data Generation**: Moved from disk to RAM, enabling infinite data.
+*   📈 **Dynamic Scaling**: Support for 10-1000 variables per SCM.
+*   🔍 **Attention Extraction**: Implicit DAG discovery via attention weights.
 *   ⚡ **GPU Optimization**: Full CUDA utilization.
+
+### Phase IV: Stability & Generalization (Current)
+*   ✅ **Infinite Data**: Dynamic seeding for non-repeating SCMs.
+*   ✅ **OOM Resolution**: Micro-batching & Gradient Accumulation.
+*   ✅ **Structure Learning**: Auxiliary loss for attention supervision.
+*   ✅ **Robustness**: Gradient Clipping & LR Scheduling.
 
 ---
 

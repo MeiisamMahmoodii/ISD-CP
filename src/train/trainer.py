@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 import numpy as np
@@ -23,7 +24,9 @@ class Trainer:
         scheduler = None,
         log_dir: str = "logs",
         accumulation_steps: int = 1,
-        micro_batch_size: int = 20 # Default safe size
+        micro_batch_size: int = 20, # Default safe size
+        lambda_aux: float = 0.1, # Weight for auxiliary attention loss
+        grad_clip: float = 1.0   # Gradient clipping value
     ):
         self.model = model.to(device)
         self.train_loader = train_loader
@@ -33,6 +36,9 @@ class Trainer:
         self.device = device
         self.accumulation_steps = accumulation_steps
         self.micro_batch_size = micro_batch_size
+        self.lambda_aux = lambda_aux
+        self.grad_clip = grad_clip
+        
         self.criterion = nn.MSELoss()
         self.writer = SummaryWriter(log_dir=log_dir)
         self.global_step = 0
@@ -43,6 +49,8 @@ class Trainer:
         """
         self.model.train()
         total_loss = 0.0
+        total_pred_loss = 0.0
+        total_aux_loss = 0.0
         
         pbar = tqdm(self.train_loader, desc="Training")
         for batch in pbar:
@@ -66,6 +74,13 @@ class Trainer:
                     value = value.squeeze(0)
                     target = target.squeeze(0)
                 
+                # Get Ground Truth Adjacency if available
+                true_adj = None
+                if 'adj' in mini_batch:
+                    true_adj = mini_batch['adj'].to(self.device)
+                    if true_adj.ndim == 3 and true_adj.shape[0] == 1:
+                        true_adj = true_adj.squeeze(0)
+                
                 # Micro-batching to avoid OOM
                 batch_size = x.shape[0]
                 num_micro_batches = (batch_size + self.micro_batch_size - 1) // self.micro_batch_size
@@ -84,34 +99,66 @@ class Trainer:
                     target_micro = target[start_idx:end_idx]
                     
                     # Forward pass
-                    pred_micro = self.model(x_micro, mask_micro, value_micro)
+                    pred_micro, attn_micro = self.model(x_micro, mask_micro, value_micro)
                     
-                    # Compute Loss
-                    loss_micro = self.criterion(pred_micro, target_micro)
+                    # Compute Prediction Loss
+                    loss_pred = self.criterion(pred_micro, target_micro)
                     
-                    # Normalize loss for micro-batches AND accumulation steps
-                    # We want the gradients to average out over the full batch
-                    # loss.backward() accumulates gradients.
-                    # If we split batch into N chunks, we should divide loss by N?
-                    # Yes, because sum(gradients) should be equivalent to full batch gradient.
-                    # Full batch loss = mean(per_sample_loss).
-                    # Micro batch loss = mean(per_sample_loss_micro).
-                    # We want to optimize for Full Batch Loss.
-                    # Gradients from micro batch are d(Mean_Micro)/dw.
-                    # We want d(Mean_Full)/dw = sum(d(Mean_Micro)/dw * (N_micro / N_total))
-                    # So we weight by micro_batch_size / total_batch_size.
+                    # Compute Auxiliary Loss (Supervised Attention)
+                    loss_aux = torch.tensor(0.0, device=self.device)
+                    if true_adj is not None:
+                        # true_adj is (num_vars, num_vars) usually, or (batch, num_vars, num_vars) if repeated?
+                        # In OnlineCausalDataset, adj is (num_vars, num_vars) repeated for each sample in batch?
+                        # No, 'adj' is added to batch_data.
+                        # If collate_fn stacks them, it becomes (batch, num_vars, num_vars).
+                        # Let's check dimensions.
+                        
+                        if true_adj.ndim == 2:
+                            # Expand to match micro batch size
+                            target_adj = true_adj.unsqueeze(0).expand(pred_micro.shape[0], -1, -1)
+                        else:
+                            # Assuming it's (batch, N, N)
+                            target_adj = true_adj[start_idx:end_idx]
+                            
+                        # attn_micro is (batch, N, N)
+                        # We want attn to match adjacency (transposed? A_ij=1 if i->j. Attn_ji means j attends to i)
+                        # If j attends to i, then i causes j.
+                        # So Attn_ji ~= Adj_ij.
+                        # Attn matrix: rows are queries (targets), cols are keys (sources).
+                        # Attn[j, i] = weight of i on j.
+                        # Adj[i, j] = 1 if i -> j.
+                        # So we want Attn[j, i] to be high if Adj[i, j] is 1.
+                        # So Target Attn = Adj.T
+                        
+                        target_attn = target_adj.transpose(1, 2)
+                        loss_aux = F.mse_loss(attn_micro, target_attn)
                     
+                    # Total Loss
+                    loss_micro = loss_pred + self.lambda_aux * loss_aux
+                    
+                    # Normalize loss for accumulation
                     weight = (end_idx - start_idx) / batch_size
                     loss_scaled = loss_micro * weight / self.accumulation_steps
                     
                     loss_scaled.backward()
                     
                     batch_loss += loss_micro.item() * weight
+                    total_pred_loss += loss_pred.item() * weight
+                    total_aux_loss += loss_aux.item() * weight
                 
-                # Optimization step (Gradient Accumulation across logical batches)
+                # Optimization step
                 if (self.global_step + 1) % self.accumulation_steps == 0:
+                    # Gradient Clipping
+                    if self.grad_clip > 0:
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
+                        
                     self.optimizer.step()
                     self.optimizer.zero_grad()
+                    
+                    # Step scheduler if it's per-step (e.g. OneCycleLR)
+                    # Assuming scheduler is per-epoch for now, or handled outside.
+                    # But if it's CosineAnnealingWarmRestarts, it might be per batch?
+                    # Let's stick to per-epoch for now unless specified.
                 
                 total_loss += batch_loss
                 self.global_step += 1
@@ -119,6 +166,7 @@ class Trainer:
                 # Log batch loss occasionally
                 if self.global_step % 10 == 0:
                     self.writer.add_scalar("Loss/TrainBatch", batch_loss, self.global_step)
+                    self.writer.add_scalar("Loss/Aux", total_aux_loss / (self.global_step % len(file_content) + 1), self.global_step) # Approx
                     # Log progress text
                     self.writer.add_text("Status", f"Epoch {epoch_idx}: Step {self.global_step}, Loss: {batch_loss:.4f}", self.global_step)
                 
@@ -148,10 +196,6 @@ class Trainer:
                 if isinstance(batch, list) and len(batch) == 1 and isinstance(batch[0], list):
                      file_content = batch[0]
                 
-                # We only need to compute SHD/F1 once per SCM (chunk), not per mini-batch
-                # But the mini-batches are just interventions on the SAME SCM.
-                # So we can pick the first mini-batch to extract the DAG.
-                
                 first_batch = True
                 
                 for mini_batch in file_content:
@@ -166,31 +210,24 @@ class Trainer:
                         value = value.squeeze(0)
                         target = target.squeeze(0)
                     
-                    pred = self.model(x, mask, value)
+                    pred, attn = self.model(x, mask, value)
                     loss = self.criterion(pred, target)
                     total_loss += loss.item()
                     
                     # Compute Metrics on the first batch of the SCM
                     if first_batch and 'adj' in mini_batch:
                         true_adj = mini_batch['adj'].numpy()
-                        # Handle squeeze if needed (it might have batch dim from collate)
                         if true_adj.ndim == 3 and true_adj.shape[0] == 1:
                             true_adj = true_adj[0]
                             
                         # Extract predicted DAG from attention
-                        pred_adj = extract_attention_dag(self.model, x, mask, value)
+                        # attn is (batch, N, N). Use the first sample or average?
+                        # extract_attention_dag handles averaging/single sample
+                        pred_adj = extract_attention_dag(attn, threshold=0.1)
                         
                         # Debug shapes if mismatch
                         if pred_adj.shape != true_adj.shape:
-                            print(f"Shape mismatch! Pred: {pred_adj.shape}, True: {true_adj.shape}")
-                            # Resize true_adj if it's smaller (likely due to networkx graph generation quirk?)
-                            # Or maybe the graph has fewer nodes than num_vars if some are isolated?
-                            # No, networkx.to_numpy_array should return (N, N) where N is number of nodes in G.
-                            # If G has fewer nodes than num_vars, that's the issue.
-                            # SCMGenerator initializes G with num_vars nodes.
-                            
-                            # Let's force shape match by padding or cropping (though cropping is bad).
-                            # Better: Ensure SCMGenerator always creates graph with num_vars nodes.
+                            # print(f"Shape mismatch! Pred: {pred_adj.shape}, True: {true_adj.shape}")
                             pass
                         
                         if pred_adj.shape == true_adj.shape:
@@ -201,10 +238,11 @@ class Trainer:
                             total_f1 += f1
                             num_graphs += 1
                             
-                            # Log Heatmap
-                            fig = plot_adjacency_heatmap(pred_adj, true_adj)
-                            self.writer.add_figure("Val/Adjacency", fig, epoch_idx)
-                            plt.close(fig)
+                            # Log Heatmap (only for the first graph of the epoch to avoid spam)
+                            if num_graphs == 1:
+                                fig = plot_adjacency_heatmap(pred_adj, true_adj)
+                                self.writer.add_figure("Val/Adjacency", fig, epoch_idx)
+                                plt.close(fig)
                             
                         first_batch = False
                     

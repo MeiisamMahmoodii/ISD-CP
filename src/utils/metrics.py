@@ -34,24 +34,22 @@ def compute_f1(pred_adj: np.ndarray, true_adj: np.ndarray) -> float:
     y_pred = pred_adj.flatten()
     return f1_score(y_true, y_pred, zero_division=0)
 
-def extract_attention_dag(model, x, mask, value, threshold=0.1):
+def extract_attention_dag(attn_weights, threshold=0.1):
     """
     Extracts implicit DAG from attention weights.
     
     Args:
-        model: The trained CausalTransformer model.
-        x, mask, value: Input tensors.
+        attn_weights: Attention weights tensor (batch_size, num_vars, num_vars).
         threshold: Value above which an attention weight is considered an edge.
         
     Returns:
         Adjacency matrix (numpy array).
     """
-    # Get attention weights from the model
-    # Shape: (batch_size, num_vars, num_vars)
-    attn_weights = model.get_attention_maps(x, mask, value)
-    
-    # Average over batch
-    avg_attn = attn_weights.mean(dim=0).numpy()
+    # Average over batch if needed, or assume it's already averaged or single sample
+    if attn_weights.ndim == 3:
+        avg_attn = attn_weights.mean(dim=0).detach().cpu().numpy()
+    else:
+        avg_attn = attn_weights.detach().cpu().numpy()
     
     # Thresholding
     # We ignore self-loops (diagonal) usually, but let's keep it simple.

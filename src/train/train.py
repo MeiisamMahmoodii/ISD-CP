@@ -46,6 +46,8 @@ def main():
     parser.add_argument("--accumulation_steps", type=int, default=1, help="Gradient accumulation steps")
     parser.add_argument("--micro_batch_size", type=int, default=20, help="Micro batch size to avoid OOM")
     parser.add_argument("--no_tensorboard", action="store_true", help="Disable auto-launch of TensorBoard")
+    parser.add_argument("--lambda_aux", type=float, default=0.1, help="Weight for auxiliary attention loss")
+    parser.add_argument("--grad_clip", type=float, default=1.0, help="Gradient clipping value")
     args = parser.parse_args()
     
     os.makedirs(args.output_dir, exist_ok=True)
@@ -63,9 +65,18 @@ def main():
         import time
         logger.info("Launching TensorBoard...")
         tb_log_dir = os.path.join(args.output_dir, "logs")
+        
+        # Try to find tensorboard in the same bin dir as python
+        tb_executable = os.path.join(os.path.dirname(sys.executable), "tensorboard")
+        if not os.path.exists(tb_executable):
+            tb_executable = "tensorboard" # Fallback to PATH
+            
         # Run in background
-        subprocess.Popen(["tensorboard", "--logdir", tb_log_dir, "--port", "6006"])
-        time.sleep(2) # Give it a sec
+        try:
+            subprocess.Popen([tb_executable, "--logdir", tb_log_dir, "--port", "6006"])
+            time.sleep(2) # Give it a sec
+        except FileNotFoundError:
+            logger.warning("TensorBoard executable not found. Skipping auto-launch.")
     
     # 1. Data
     # Use OnlineCausalDataset for infinite/large-scale data without storage
@@ -109,6 +120,10 @@ def main():
     # AdamW is standard for Transformers
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
     
+    # Scheduler
+    # Cosine Annealing with Warm Restarts
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=2)
+    
     # 4. Trainer
     # Initialize the Trainer class which manages the loop
     trainer = Trainer(
@@ -117,9 +132,12 @@ def main():
         val_loader=val_loader,
         optimizer=optimizer,
         device="cuda" if torch.cuda.is_available() else "cpu",
+        scheduler=scheduler,
         log_dir=os.path.join(args.output_dir, "logs"),
         accumulation_steps=args.accumulation_steps,
-        micro_batch_size=args.micro_batch_size
+        micro_batch_size=args.micro_batch_size,
+        lambda_aux=args.lambda_aux,
+        grad_clip=args.grad_clip
     )
     
     # 5. Loop

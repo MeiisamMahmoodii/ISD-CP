@@ -1,6 +1,27 @@
 import torch
 import torch.nn as nn
 import math
+import torch.nn.functional as F
+
+class TabPFNStyleEmbedding(nn.Module):
+    """
+    Embeds scalar values using a small MLP, similar to TabPFN's approach for numerical features.
+    This allows the model to learn non-linear representations of scalar values.
+    """
+    def __init__(self, d_model):
+        super().__init__()
+        self.linear1 = nn.Linear(1, d_model * 2)
+        self.activation = nn.GELU()
+        self.linear2 = nn.Linear(d_model * 2, d_model)
+        self.layer_norm = nn.LayerNorm(d_model)
+
+    def forward(self, x):
+        # x: (..., 1)
+        x = self.linear1(x)
+        x = self.activation(x)
+        x = self.linear2(x)
+        x = self.layer_norm(x)
+        return x
 
 class CausalTransformer(nn.Module):
     """
@@ -16,6 +37,7 @@ class CausalTransformer(nn.Module):
     - It uses self-attention to implicitly learn the causal structure (dependencies) 
       between variables.
     - It uses a "Fixed Reference Frame" via standardized inputs.
+    - **Supervised Attention**: It returns attention weights to be supervised by the ground truth DAG.
     
     Input Token Construction:
     For each variable i, the input token is a sum of:
@@ -45,10 +67,11 @@ class CausalTransformer(nn.Module):
         super().__init__()
         self.num_vars = num_vars
         self.d_model = d_model
+        self.num_layers = num_layers
         
         # 1. Embeddings
-        # Feature Embedding: Project scalar feature to d_model
-        self.feature_emb = nn.Linear(1, d_model)
+        # Feature Embedding: Project scalar feature to d_model using TabPFN style
+        self.feature_emb = TabPFNStyleEmbedding(d_model)
         
         # Variable ID Embedding: Learnable vector for each variable
         # This allows the model to distinguish between "Temperature" and "Pressure"
@@ -60,19 +83,21 @@ class CausalTransformer(nn.Module):
         
         # Value Embedding: Project standardized intervention value to d_model
         # Tells the model: "We are setting it to this value (z-score)"
-        self.value_emb = nn.Linear(1, d_model)
+        self.value_emb = TabPFNStyleEmbedding(d_model)
         
         # 2. Transformer Encoder
-        # Standard PyTorch Transformer Encoder
-        # Bidirectional attention allows all variables to attend to each other
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_model, 
-            nhead=nhead, 
-            dim_feedforward=dim_feedforward, 
-            dropout=dropout,
-            batch_first=True
-        )
-        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        # We use a ModuleList of TransformerEncoderLayers to manually control the forward pass
+        # and extract attention weights.
+        self.layers = nn.ModuleList([
+            nn.TransformerEncoderLayer(
+                d_model=d_model, 
+                nhead=nhead, 
+                dim_feedforward=dim_feedforward, 
+                dropout=dropout,
+                batch_first=True
+            )
+            for _ in range(num_layers)
+        ])
         
         # 3. Output Head
         # Predicts scalar Z-score for each variable
@@ -83,11 +108,11 @@ class CausalTransformer(nn.Module):
     def _init_weights(self):
         """Initialize weights for better convergence."""
         initrange = 0.1
-        self.feature_emb.weight.data.uniform_(-initrange, initrange)
-        self.feature_emb.bias.data.zero_()
         self.var_id_emb.weight.data.uniform_(-initrange, initrange)
         self.output_head.bias.data.zero_()
         self.output_head.weight.data.uniform_(-initrange, initrange)
+        self.mask_emb.weight.data.uniform_(-initrange, initrange)
+        self.mask_emb.bias.data.zero_()
 
     def forward(self, x, mask, value):
         """
@@ -99,7 +124,8 @@ class CausalTransformer(nn.Module):
             value: Intervention value (batch_size, num_vars) - Non-zero only at intervened idx.
             
         Returns:
-            Predicted post-intervention values (batch_size, num_vars).
+            prediction: Predicted post-intervention values (batch_size, num_vars).
+            avg_attn: Averaged attention weights (batch_size, num_vars, num_vars).
         """
         batch_size, seq_len = x.shape
         
@@ -118,123 +144,90 @@ class CausalTransformer(nn.Module):
         # This summation fuses all information into a single vector per variable
         token = x_emb + id_emb + m_emb + v_emb
         
-        # Transformer Pass
-        # No causal mask (bidirectional) - we want to learn the full graph structure
-        output = self.transformer_encoder(token)
-        
-        # Prediction
-        # Map back from d_model to scalar output
-        prediction = self.output_head(output).squeeze(-1)
-        
-        return prediction
-
-    def get_attention_maps(self, x, mask, value):
-        """
-        Runs a forward pass and returns the averaged attention weights across all heads and layers.
-        
-        Args:
-            x, mask, value: Input tensors.
-            
-        Returns:
-            Attention matrix (batch_size, num_vars, num_vars).
-        """
-        self.eval()
-        attentions = []
-        
-        def hook_fn(module, input, output):
-            # output is (attn_output, attn_output_weights) if need_weights=True
-            # But nn.TransformerEncoderLayer calls self_attn(..., need_weights=False) by default usually?
-            # Actually, in PyTorch implementation of TransformerEncoderLayer:
-            # x, _ = self.self_attn(x, x, x, key_padding_mask=...)
-            # It discards weights.
-            # So hooks on the module output won't work if weights aren't returned.
-            pass
-
-        # Since TransformerEncoderLayer doesn't return weights, we can't easily hook it 
-        # unless we rely on the internal implementation details or use a custom encoder.
-        
-        # ALTERNATIVE: Re-implement the encoder loop manually for this method.
-        # This ensures we can force need_weights=True.
-        
-        batch_size, seq_len = x.shape
-        var_ids = torch.arange(seq_len, device=x.device).unsqueeze(0).expand(batch_size, -1)
-        
-        x_emb = self.feature_emb(x.unsqueeze(-1))
-        id_emb = self.var_id_emb(var_ids)
-        m_emb = self.mask_emb(mask.unsqueeze(-1))
-        v_emb = self.value_emb(value.unsqueeze(-1))
-        
-        src = x_emb + id_emb + m_emb + v_emb
-        
-        # Iterate through layers manually
-        for layer in self.transformer_encoder.layers:
-            # We access the self_attn module directly
-            # layer.self_attn is a MultiheadAttention
-            # We need to replicate what the layer does:
-            #   x = src
-            #   x = self.norm1(x + self._sa_block(x))
-            #   x = self.norm2(x + self._ff_block(x))
-            
-            # But _sa_block calls self_attn.
-            # We can call self_attn directly with need_weights=True
-            
-            # Note: This is brittle if PyTorch changes internal names, but standard for research code.
-            # Standard TransformerEncoderLayer structure:
-            # self.self_attn(src, src, src, ...)
-            
-            # Let's just call the attention module to get weights, 
-            # but we must ensure we pass the right inputs (which is the output of previous layer).
-            
-            # To get the weights *used* during the pass, we really should have used a custom layer.
-            # But for "extraction" (post-hoc), we can just run the attention again?
-            # No, because the input to layer i depends on layer i-1.
-            
-            # Robust approach: Run the full layer, but capture weights via a temporary hook 
-            # IF we can force need_weights=True. We can't easily force it on the standard layer.
-            
-            # FALLBACK: Use a custom TransformerEncoder implementation in this file 
-            # that saves attention weights.
-            pass
-            
-        # Let's replace the standard TransformerEncoder with a custom one that supports weight extraction.
-        # For now, to minimize code changes, I will implement a custom forward pass 
-        # that iterates layers and calls self_attn manually with need_weights=True.
-        
-        current_out = src
+        # Transformer Pass with Attention Extraction
+        current_out = token
         layer_attns = []
         
-        for layer in self.transformer_encoder.layers:
-            # Replicate Pre-Norm or Post-Norm? PyTorch default is Post-Norm.
-            # x = norm(x + attn(x))
-            
-            # 1. Self Attention
+        for layer in self.layers:
             # We need to call layer.self_attn manually to get weights
             # MultiheadAttention forward signature: query, key, value
             # For self-attention: src, src, src
             
             # We assume batch_first=True was passed to encoder layer
-            attn_out, attn_weights = layer.self_attn(
-                current_out, current_out, current_out,
+            # layer.self_attn returns (attn_output, attn_output_weights)
+            # We need to pass need_weights=True
+            
+            # Note: nn.TransformerEncoderLayer implementation details:
+            # x = src
+            # if self.norm_first:
+            #     x = x + self._sa_block(self.norm1(x))
+            #     x = x + self._ff_block(self.norm2(x))
+            # else:
+            #     x = self.norm1(x + self._sa_block(x))
+            #     x = self.norm2(x + self._ff_block(x))
+            
+            # _sa_block calls self.self_attn
+            
+            # To correctly replicate the layer logic AND get weights, we have to be careful.
+            # It's safer to just rely on the fact that we want the weights from the *current* representation.
+            # We can run self_attn separately to get weights, and then run the layer normally.
+            # This adds a bit of compute overhead (running attention twice) but ensures correctness of the forward pass.
+            
+            # 1. Extract Attention Weights
+            # We use the input to the layer (or normalized input if norm_first)
+            # Default TransformerEncoderLayer is norm_first=False (Post-LN).
+            # So input to attention is just `current_out`.
+            
+            with torch.no_grad(): # We don't need gradients for the extraction pass if we only use it for logging/aux loss target?
+                # Actually we DO need gradients if we want to supervise the attention weights!
+                # So we cannot use no_grad.
+                pass
+
+            # However, running it twice is inefficient and might cause issues if we optimize the "extraction" path
+            # but the "forward" path uses a different computation graph (though sharing weights).
+            
+            # Better approach:
+            # Manually implement the layer logic here.
+            # Assuming Post-LN (default):
+            # x = self.norm1(x + self._sa_block(x))
+            # x = self.norm2(x + self._ff_block(x))
+            
+            src = current_out
+            
+            # Self Attention Block
+            # attn_output, attn_weights = layer.self_attn(src, src, src, need_weights=True, average_attn_weights=True)
+            # But layer.self_attn expects (seq, batch, dim) if batch_first=False.
+            # We set batch_first=True.
+            
+            attn_output, attn_weights = layer.self_attn(
+                src, src, src,
                 need_weights=True,
-                average_attn_weights=True # Return (batch, seq, seq)
+                average_attn_weights=True # Returns (batch, seq, seq)
             )
             
-            layer_attns.append(attn_weights.detach().cpu())
+            # Dropout and Residual
+            src = src + layer.dropout1(attn_output)
+            src = layer.norm1(src)
             
-            # Continue the forward pass to get input for next layer
-            # We can just call the layer! 
-            # But we already computed attn_out.
-            # Let's just call layer(current_out) to be safe and correct, 
-            # even if it recomputes attention (without weights).
-            # It's slightly inefficient but correct.
-            current_out = layer(current_out)
+            # Feed Forward Block
+            # layer.linear1, layer.activation, layer.dropout, layer.linear2, layer.dropout2
+            src2 = layer.linear2(layer.dropout(layer.activation(layer.linear1(src))))
+            src = src + layer.dropout2(src2)
+            src = layer.norm2(src)
+            
+            current_out = src
+            layer_attns.append(attn_weights)
             
         # Stack and average across layers
         # Shape: (num_layers, batch, seq, seq)
         all_attns = torch.stack(layer_attns)
         avg_attn = torch.mean(all_attns, dim=0) # Average over layers
         
-        return avg_attn
+        # Prediction
+        # Map back from d_model to scalar output
+        prediction = self.output_head(current_out).squeeze(-1)
+        
+        return prediction, avg_attn
 
 if __name__ == "__main__":
     # Test
@@ -245,5 +238,7 @@ if __name__ == "__main__":
     value = torch.zeros(5, 10)
     value[:, 0] = 2.0
     
-    out = model(x, mask, value)
-    print("Output shape:", out.shape)
+    pred, attn = model(x, mask, value)
+    print("Prediction shape:", pred.shape)
+    print("Attention shape:", attn.shape)
+

@@ -40,5 +40,8 @@ def analyze_logs(log_dir):
             second_half = np.mean(values[len(values)//2:])
             print(f"Trend (First Half -> Second Half): {first_half:.4f} -> {second_half:.4f}")
 
+import sys
+
 if __name__ == "__main__":
-    analyze_logs('checkpoints_prod/logs')
+    log_dir = sys.argv[1] if len(sys.argv) > 1 else 'checkpoints_prod/logs'
+    analyze_logs(log_dir)
