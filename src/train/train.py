@@ -47,7 +47,11 @@ def main():
     parser.add_argument("--micro_batch_size", type=int, default=20, help="Micro batch size to avoid OOM")
     parser.add_argument("--no_tensorboard", action="store_true", help="Disable auto-launch of TensorBoard")
     parser.add_argument("--lambda_aux", type=float, default=0.1, help="Weight for auxiliary attention loss")
+    parser.add_argument("--lambda_sparse", type=float, default=0.01, help="Weight for L1 sparsity penalty on attention")
+    parser.add_argument("--edge_threshold", type=float, default=0.1, help="Threshold for converting attention to edges")
+    parser.add_argument("--reuse_factor", type=int, default=1, help="Reuse same SCMs for N epochs")
     parser.add_argument("--grad_clip", type=float, default=1.0, help="Gradient clipping value")
+    parser.add_argument("--resume_checkpoint", type=str, default=None, help="Path to checkpoint to resume from")
     args = parser.parse_args()
     
     os.makedirs(args.output_dir, exist_ok=True)
@@ -116,6 +120,14 @@ def main():
         num_layers=args.num_layers,
         dropout=0.1
     )
+    
+    # Load checkpoint if requested
+    if args.resume_checkpoint:
+        logger.info(f"Loading checkpoint from {args.resume_checkpoint}...")
+        state_dict = torch.load(args.resume_checkpoint, map_location="cpu")
+        model.load_state_dict(state_dict)
+        logger.info("Checkpoint loaded successfully.")
+        
     # 3. Optimizer
     # AdamW is standard for Transformers
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
@@ -137,6 +149,8 @@ def main():
         accumulation_steps=args.accumulation_steps,
         micro_batch_size=args.micro_batch_size,
         lambda_aux=args.lambda_aux,
+        lambda_sparse=args.lambda_sparse,
+        edge_threshold=args.edge_threshold,
         grad_clip=args.grad_clip
     )
     
@@ -146,7 +160,8 @@ def main():
     
     for epoch in range(args.epochs):
         # Update dataset epoch to generate new SCMs
-        dataset.set_epoch(epoch)
+        # If reuse_factor > 1, we stay on the same "dataset epoch" for multiple training epochs
+        dataset.set_epoch(epoch // args.reuse_factor)
         
         loss = trainer.train_epoch(epoch)
         val_loss, val_shd, val_f1 = trainer.validate(epoch)

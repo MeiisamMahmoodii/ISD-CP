@@ -26,6 +26,8 @@ class Trainer:
         accumulation_steps: int = 1,
         micro_batch_size: int = 20, # Default safe size
         lambda_aux: float = 0.1, # Weight for auxiliary attention loss
+        lambda_sparse: float = 0.01, # Weight for sparsity penalty
+        edge_threshold: float = 0.1, # Threshold for edge detection
         grad_clip: float = 1.0   # Gradient clipping value
     ):
         self.model = model.to(device)
@@ -37,6 +39,8 @@ class Trainer:
         self.accumulation_steps = accumulation_steps
         self.micro_batch_size = micro_batch_size
         self.lambda_aux = lambda_aux
+        self.lambda_sparse = lambda_sparse
+        self.edge_threshold = edge_threshold
         self.grad_clip = grad_clip
         
         self.criterion = nn.MSELoss()
@@ -50,7 +54,9 @@ class Trainer:
         self.model.train()
         total_loss = 0.0
         total_pred_loss = 0.0
+        total_pred_loss = 0.0
         total_aux_loss = 0.0
+        total_sparse_loss = 0.0
         
         pbar = tqdm(self.train_loader, desc="Training")
         for batch in pbar:
@@ -133,8 +139,14 @@ class Trainer:
                         target_attn = target_adj.transpose(1, 2)
                         loss_aux = F.mse_loss(attn_micro, target_attn)
                     
+                        loss_aux = F.mse_loss(attn_micro, target_attn)
+                    
+                    # Compute Sparsity Penalty (L1 on Attention)
+                    # We want the attention matrix to be sparse (few edges)
+                    loss_sparse = torch.mean(torch.abs(attn_micro))
+
                     # Total Loss
-                    loss_micro = loss_pred + self.lambda_aux * loss_aux
+                    loss_micro = loss_pred + self.lambda_aux * loss_aux + self.lambda_sparse * loss_sparse
                     
                     # Normalize loss for accumulation
                     weight = (end_idx - start_idx) / batch_size
@@ -145,6 +157,7 @@ class Trainer:
                     batch_loss += loss_micro.item() * weight
                     total_pred_loss += loss_pred.item() * weight
                     total_aux_loss += loss_aux.item() * weight
+                    total_sparse_loss += loss_sparse.item() * weight
                 
                 # Optimization step
                 if (self.global_step + 1) % self.accumulation_steps == 0:
@@ -166,7 +179,10 @@ class Trainer:
                 # Log batch loss occasionally
                 if self.global_step % 10 == 0:
                     self.writer.add_scalar("Loss/TrainBatch", batch_loss, self.global_step)
+                    self.writer.add_scalar("Loss/TrainBatch", batch_loss, self.global_step)
                     self.writer.add_scalar("Loss/Aux", total_aux_loss / (self.global_step % len(file_content) + 1), self.global_step) # Approx
+                    self.writer.add_scalar("Loss/Sparse", total_sparse_loss / (self.global_step % len(file_content) + 1), self.global_step) # Approx
+                    # Log progress text
                     # Log progress text
                     self.writer.add_text("Status", f"Epoch {epoch_idx}: Step {self.global_step}, Loss: {batch_loss:.4f}", self.global_step)
                 
@@ -223,7 +239,7 @@ class Trainer:
                         # Extract predicted DAG from attention
                         # attn is (batch, N, N). Use the first sample or average?
                         # extract_attention_dag handles averaging/single sample
-                        pred_adj = extract_attention_dag(attn, threshold=0.1)
+                        pred_adj = extract_attention_dag(attn, threshold=self.edge_threshold)
                         
                         # Debug shapes if mismatch
                         if pred_adj.shape != true_adj.shape:

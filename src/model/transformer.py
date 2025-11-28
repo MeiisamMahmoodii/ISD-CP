@@ -220,8 +220,14 @@ class CausalTransformer(nn.Module):
             
         # Stack and average across layers
         # Shape: (num_layers, batch, seq, seq)
-        all_attns = torch.stack(layer_attns)
-        avg_attn = torch.mean(all_attns, dim=0) # Average over layers
+        # Stack and average across layers
+        # Shape: (num_layers, batch, seq, seq)
+        # all_attns = torch.stack(layer_attns)
+        # avg_attn = torch.mean(all_attns, dim=0) # Average over layers
+        
+        # Use LAST layer attention for structure extraction
+        # The last layer represents the final "decision" or "structure" of the model.
+        avg_attn = layer_attns[-1]
         
         # Prediction
         # Map back from d_model to scalar output
