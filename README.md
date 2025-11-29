@@ -14,77 +14,71 @@ Unlike traditional Causal Bayesian Networks that rely on explicit, often brittle
 ### Why ISD-CP?
 *   **Structure-Agnostic**: No need for prior knowledge of the causal graph.
 *   **Infinite Scalability**: Trained on an infinite stream of synthetic Structural Causal Models (SCMs) generated on-the-fly.
-*   **Structure-Agnostic**: No need for prior knowledge of the causal graph.
-*   **Infinite Scalability**: Trained on an infinite stream of synthetic Structural Causal Models (SCMs) generated on-the-fly.
 *   **Zero-Shot Generalization**: Capable of predicting interventions on unseen causal systems immediately.
 
-## 🚀 Recent Updates & Improvements
-*   **Infinite Data Generation**: The model now sees unique, randomly generated SCMs in every epoch, preventing overfitting and ensuring true generalization.
-*   **Micro-Batching**: Implemented gradient accumulation with micro-batches to support large effective batch sizes on limited GPU memory (fixing OOM errors).
-*   **Structural Guidance**: Added an auxiliary loss term (`lambda_aux`) that supervises the attention weights with the ground-truth adjacency matrix, accelerating structure learning.
-*   **Stability**: Integrated Gradient Clipping and Cosine Annealing Warm Restarts scheduler for stable, robust training.
-*   **Observability**: Enhanced TensorBoard integration with auto-launch, text status logging, and file-based logging (`train.log`).
+---
+
+## 🧪 Lab Report & Project History
+
+This project has evolved through several phases of research and engineering. Here is the full story of our architectural decisions.
+
+### Phase I: The Naive Approach (The "Lazy Model")
+**Goal**: Train a Transformer to predict $Y_{post}$ given $X_{pre}$ and an intervention $do(X_i=v)$.
+**Outcome**: **Failure**. The model learned to simply copy the input ($Y_{post} \approx X_{pre}$).
+**Why?**: In a sparse causal graph, an intervention on node $X_i$ only affects its descendants. For 80-90% of variables, the value *does not change*. The model found that outputting the input was a "safe bet" that minimized MSE, resulting in a local minimum where it ignored the intervention entirely.
+
+### Phase II: Infinite Data & Scaling
+**Goal**: Solve overfitting.
+**Action**: We moved from a static dataset to an **Online Data Generator**.
+**Mechanism**:
+-   Every batch generates a **brand new SCM** (random DAG, random weights, random noise).
+-   The model never sees the same causal system twice.
+**Outcome**: **Success**. This forced the model to learn *generalizable rules of causality* rather than memorizing specific graphs.
+
+### Phase III: Structural Guidance
+**Goal**: Help the model "see" the graph.
+**Action**: We added **Supervised Attention**.
+**Mechanism**: We trained the model's internal attention weights to match the ground-truth adjacency matrix ($Loss_{aux} = ||Attn - Adj||^2$).
+**Outcome**: **Partial Success**. The model started looking at the right variables, but still struggled to predict the exact numerical impact.
+
+### Phase IV: The Delta Pivot (Current Architecture)
+**Goal**: Force the model to abandon the "copying" strategy.
+**Action**: **Delta Prediction**.
+**Mechanism**: Instead of predicting the final value $Y$, the model now predicts the **change** $\Delta = Y - X$.
+-   **Target**: For non-descendants, the target is exactly **0**.
+-   **Impact**: The model *cannot* just copy the input. To get a low loss, it MUST identify which variables change (descendants) and predict the magnitude of that change.
+**Outcome**: **Breakthrough**. This acted as a dense reward signal, drastically improving causal discovery and prediction accuracy.
 
 ---
 
-## 📐 Problem Formulation
-
-We consider a causal system represented by a Structural Causal Model (SCM) $\mathcal{M} = (\mathbf{X}, \mathbf{U}, \mathbf{F}, P(\mathbf{U}))$, where $\mathbf{X} = \{X_1, \dots, X_d\}$ are endogenous variables and $\mathbf{U}$ are exogenous noise variables.
-
-The goal is to predict the distribution of the system under an intervention $\text{do}(X_i = x)$.
-
-Formally, given:
-1.  A **Baseline** observation vector: $\mathbf{x}^{(b)} \sim P_{\mathcal{M}}(\mathbf{X})$
-2.  An **Intervention** tuple: $(k, \alpha)$, where we set $X_k \leftarrow \alpha$.
-
-The model $f_\theta$ predicts the expected value of the remaining variables:
-
-$$ \hat{\mathbf{x}}^{(int)} = f_\theta(\mathbf{x}^{(b)}, k, \alpha) \approx \mathbb{E}[ \mathbf{X} \mid \text{do}(X_k = \alpha), \mathbf{x}^{(b)}_{\text{parents}} ] $$
-
-To ensure generalizability across different scales, all inputs are standardized relative to the baseline statistics $\mu^{(b)}, \sigma^{(b)}$.
-
----
-
-## 🏗️ Architecture
+## 🏗️ Detailed Architecture
 
 ISD-CP utilizes a modified Transformer Encoder architecture optimized for tabular data.
 
-```mermaid
-graph TD
-    subgraph Input Processing
-        B[Baseline Values] --> Emb[Feature Embedding]
-        I[Intervention Token] --> Emb
-        M[Masks] --> Emb
-        Emb --> Pos[Variable ID Embedding]
-    end
+### 1. TabPFN-Style Embeddings
+Standard Transformers use linear layers to embed inputs. However, for tabular data, the specific *value* of a number matters (e.g., 0.1 vs 0.9).
+We adopted the **TabPFN** approach:
+-   **Input**: A single scalar value $x$.
+-   **Mechanism**: A small MLP `Linear(1 -> d*2) -> GELU -> Linear(d*2 -> d)`.
+-   **Why?**: This allows the model to learn non-linear representations of scalar values, enabling it to distinguish between "low", "medium", and "high" values in a soft, differentiable way.
 
-    subgraph Transformer Core
-        Pos --> L1[Layer 1: Self-Attention]
-        L1 --> L2[Layer 2: Self-Attention]
-        L2 --> LN[...]
-        LN --> LN_Final[Layer N: Self-Attention]
-    end
+### 2. The Delta Output Head
+The final layer of the model is a linear projection `Linear(d_model -> 1)`.
+-   **Output**: $\hat{\delta}_j$ (Predicted change for variable $j$).
+-   **Final Prediction**: $\hat{y}_j = x_j + \hat{\delta}_j$.
+-   **Loss Function**: $L = || \hat{\delta} - (y_{true} - x_{base}) ||^2$.
 
-    subgraph Prediction Head
-        LN_Final --> MLP[MLP Projection]
-        MLP --> Out[Predicted Post-Intervention State]
-    end
-
-    Pos --> L1
-    LN_Final --> MLP
-```
-
-### Key Components
-1.  **TabPFN-Style Embeddings**: Maps scalar values to high-dimensional vectors using learned prototypes.
-2.  **Masked Attention**: Ensures the model respects the intervention (e.g., the intervened variable $X_k$ is fixed).
-2.  **Masked Attention**: Ensures the model respects the intervention (e.g., the intervened variable $X_k$ is fixed).
-3.  **Implicit DAG Extraction**: Attention weights $\mathbf{A}$ in the final layers approximate the adjacency matrix of the underlying causal graph. This is now explicitly supervised via an auxiliary loss.
+### 3. Implicit DAG Extraction
+We extract the attention weights from the **last layer** of the Transformer.
+-   **Interpretation**: $A_{ij}$ represents how much variable $j$ "attends" to variable $i$.
+-   **Causal Meaning**: If $j$ attends to $i$, it implies $i$ is a cause of $j$.
+-   **Sparsity**: We apply an L1 penalty to these weights to encourage a sparse graph (Occam's Razor).
 
 ---
 
 ## 🔄 Data Generation Pipeline
 
-We solve the data scarcity problem by generating data **online**. We do not read from a static dataset; instead, we create a new random SCM for every batch.
+We generate data **online** to ensure infinite variety.
 
 ```mermaid
 sequenceDiagram
@@ -97,62 +91,45 @@ sequenceDiagram
     D->>G: Generate Random SCM (d=10..1000)
     G-->>D: SCM (Equations & Graph)
     D->>S: Sample Baseline Data (N=1000)
-    D->>S: Sample Interventional Data
+    D->>S: Sample Interventional Data (Big Shocks: +/- 5 sigma)
     S-->>D: (x_base, x_int)
     D->>D: Standardize & Tokenize
     D-->>T: Tensor Batch
 ```
 
-*   **Infinite Variety**: Random DAGs, mixed mechanisms (Linear, MLP, Sigmoid), and diverse noise distributions.
-*   **Zero Storage**: No disk I/O bottlenecks. 1.9TB of equivalent static data is generated in RAM.
-
 ---
 
-## 🚀 Installation
+## 🚀 Installation & Usage
 
-1.  **Clone the repository**:
-    ```bash
-    git clone https://github.com/yourusername/ISD-CP.git
-    cd ISD-CP
-    ```
+### 1. Installation
+```bash
+git clone https://github.com/yourusername/ISD-CP.git
+cd ISD-CP
+python3 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+```
 
-2.  **Set up the environment**:
-    ```bash
-    python3 -m venv venv
-    source venv/bin/activate
-    pip install -r requirements.txt
-    ```
-
----
-
-## 💻 Usage
-
-### Training
-Start a production-grade training run. The system will automatically utilize available GPUs.
-
+### 2. Training (Production)
 ```bash
 python -m src.train.train --output_dir checkpoints_prod --num_scms 1000 --epochs 500
 ```
 
-| Argument | Default | Description |
-| :--- | :--- | :--- |
-| `--num_scms` | 100 | Number of unique SCMs to generate per epoch. |
-| `--batch_size` | 100 | Samples per update step. |
-| `--min_vars` | 10 | Minimum number of variables in a generated SCM. |
-| `--max_vars` | 1000 | Maximum number of variables (dynamic scaling). |
-| `--min_vars` | 10 | Minimum number of variables in a generated SCM. |
-| `--max_vars` | 1000 | Maximum number of variables (dynamic scaling). |
-| `--lr` | 1e-4 | Learning rate. |
-| `--accumulation_steps` | 1 | Gradient accumulation steps. |
-| `--micro_batch_size` | 20 | Micro-batch size to prevent OOM. |
-| `--lambda_aux` | 0.1 | Weight for auxiliary attention loss (structure learning). |
-| `--grad_clip` | 1.0 | Gradient clipping norm. |
-
-### Monitoring
-We provide rich logging via TensorBoard. Track Loss, Structural Hamming Distance (SHD), and F1 Scores in real-time.
-
+### 3. Analysis
+Use the `find_best_model.py` script to analyze training logs and find the best checkpoint based on F1 Score and SHD.
 ```bash
-tensorboard --logdir checkpoints_prod/logs
+python find_best_model.py checkpoints_prod/logs
+```
+
+**Output Example**:
+```text
+Run Date             | Epoch | F1       | SHD    | Loss       | Log File
+-----------------------------------------------------------------------------------------------
+2025-11-28 12:02     | 77    | 0.4479   | 4.60   | 13.5090    | events.out.tfevents...
+===============================================================================================
+*** OVERALL BEST RUN ***
+Best Epoch: 77
+F1 Score: 0.4479
 ```
 
 ---
@@ -163,44 +140,17 @@ tensorboard --logdir checkpoints_prod/logs
 ISD-CP/
 ├── src/
 │   ├── data/
-│   │   ├── scm_generator.py    # 🎲 The Engine: Generates random SCMs
-│   │   ├── dataset.py          # 🔄 Online Dataset implementation
+│   │   ├── scm_generator.py    # 🎲 Generates random SCMs
+│   │   ├── dataset.py          # 🔄 Online Dataset (Infinite Data)
 │   │   └── processor.py        # 📊 Standardization logic
 │   ├── model/
-│   │   └── transformer.py      # 🧠 The Brain: Causal Transformer
+│   │   └── transformer.py      # 🧠 Causal Transformer (Delta Prediction)
 │   └── train/
-│       └── train.py            # 🏋️ Training entry point
+│       └── train.py            # 🏋️ Training Loop & Delta Loss
 ├── configs/                    # ⚙️ YAML configurations
 ├── checkpoints_prod/           # 💾 Saved models and logs
-└── requirements.txt            # 📦 Dependencies
+└── find_best_model.py          # 📈 Analysis Script
 ```
-
----
-
-## 📜 History & Changelog
-
-### Phase I: Causal Data Engineer (CDE)
-*   ✅ Implemented `SCMGenerator` for synthetic SCMs.
-*   ✅ Built `DataSampler` for baseline/interventional sampling.
-
-### Phase II: ML Engineer (MLE)
-*   ✅ Developed `CausalTransformer` architecture.
-*   ✅ Implemented robust `Trainer` loop.
-
-### Phase III: ML Architect (MLA) & Scaling
-*   🚀 **Online Data Generation**: Moved from disk to RAM, enabling infinite data.
-*   📈 **Dynamic Scaling**: Support for 10-1000 variables per SCM.
-*   🔍 **Attention Extraction**: Implicit DAG discovery via attention weights.
-*   🚀 **Online Data Generation**: Moved from disk to RAM, enabling infinite data.
-*   📈 **Dynamic Scaling**: Support for 10-1000 variables per SCM.
-*   🔍 **Attention Extraction**: Implicit DAG discovery via attention weights.
-*   ⚡ **GPU Optimization**: Full CUDA utilization.
-
-### Phase IV: Stability & Generalization (Current)
-*   ✅ **Infinite Data**: Dynamic seeding for non-repeating SCMs.
-*   ✅ **OOM Resolution**: Micro-batching & Gradient Accumulation.
-*   ✅ **Structure Learning**: Auxiliary loss for attention supervision.
-*   ✅ **Robustness**: Gradient Clipping & LR Scheduling.
 
 ---
 

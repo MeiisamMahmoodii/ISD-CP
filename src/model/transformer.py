@@ -124,7 +124,7 @@ class CausalTransformer(nn.Module):
             value: Intervention value (batch_size, num_vars) - Non-zero only at intervened idx.
             
         Returns:
-            prediction: Predicted post-intervention values (batch_size, num_vars).
+            delta_pred: Predicted change from baseline (batch_size, num_vars).
             avg_attn: Averaged attention weights (batch_size, num_vars, num_vars).
         """
         batch_size, seq_len = x.shape
@@ -230,10 +230,10 @@ class CausalTransformer(nn.Module):
         avg_attn = layer_attns[-1]
         
         # Prediction
-        # Map back from d_model to scalar output
-        prediction = self.output_head(current_out).squeeze(-1)
+        # Map back from d_model to scalar output (Delta)
+        delta_pred = self.output_head(current_out).squeeze(-1)
         
-        return prediction, avg_attn
+        return delta_pred, avg_attn
 
 if __name__ == "__main__":
     # Test

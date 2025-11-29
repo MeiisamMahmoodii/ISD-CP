@@ -158,6 +158,9 @@ def main():
     logger.info(f"Starting training on {trainer.device}...")
     log_gpu_usage()
     
+    best_f1 = -1.0
+    best_shd = float('inf')
+
     for epoch in range(args.epochs):
         # Update dataset epoch to generate new SCMs
         # If reuse_factor > 1, we stay on the same "dataset epoch" for multiple training epochs
@@ -167,9 +170,23 @@ def main():
         val_loss, val_shd, val_f1 = trainer.validate(epoch)
         logger.info(f"Epoch {epoch+1}/{args.epochs} - Train Loss: {loss:.4f} - Val Loss: {val_loss:.4f} - SHD: {val_shd:.2f} - F1: {val_f1:.4f}")
         
-        # Save checkpoint
-        torch.save(model.state_dict(), os.path.join(args.output_dir, f"model_epoch_{epoch+1}.pt"))
-        logger.info(f"Saved checkpoint: model_epoch_{epoch+1}.pt")
+        # Save Last Checkpoint (Overwrite)
+        torch.save(model.state_dict(), os.path.join(args.output_dir, "model_last.pt"))
+        
+        # Save Best Checkpoint (Based on F1, then SHD)
+        is_best = False
+        if val_f1 > best_f1:
+            is_best = True
+        elif val_f1 == best_f1 and val_shd < best_shd:
+            is_best = True
+            
+        if is_best:
+            best_f1 = val_f1
+            best_shd = val_shd
+            torch.save(model.state_dict(), os.path.join(args.output_dir, "model_best.pt"))
+            logger.info(f"New Best Model! F1: {best_f1:.4f}, SHD: {best_shd:.2f}")
+            
+        logger.info(f"Saved checkpoint: model_last.pt")
 
 if __name__ == "__main__":
     main()

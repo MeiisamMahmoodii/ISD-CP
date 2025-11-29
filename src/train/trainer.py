@@ -105,10 +105,12 @@ class Trainer:
                     target_micro = target[start_idx:end_idx]
                     
                     # Forward pass
-                    pred_micro, attn_micro = self.model(x_micro, mask_micro, value_micro)
+                    pred_delta, attn_micro = self.model(x_micro, mask_micro, value_micro)
                     
-                    # Compute Prediction Loss
-                    loss_pred = self.criterion(pred_micro, target_micro)
+                    # Compute Prediction Loss (Delta Reward)
+                    # Target is the CHANGE from baseline
+                    target_delta = target_micro - x_micro
+                    loss_pred = self.criterion(pred_delta, target_delta)
                     
                     # Compute Auxiliary Loss (Supervised Attention)
                     loss_aux = torch.tensor(0.0, device=self.device)
@@ -121,7 +123,7 @@ class Trainer:
                         
                         if true_adj.ndim == 2:
                             # Expand to match micro batch size
-                            target_adj = true_adj.unsqueeze(0).expand(pred_micro.shape[0], -1, -1)
+                            target_adj = true_adj.unsqueeze(0).expand(pred_delta.shape[0], -1, -1)
                         else:
                             # Assuming it's (batch, N, N)
                             target_adj = true_adj[start_idx:end_idx]
@@ -226,8 +228,11 @@ class Trainer:
                         value = value.squeeze(0)
                         target = target.squeeze(0)
                     
-                    pred, attn = self.model(x, mask, value)
-                    loss = self.criterion(pred, target)
+                    pred_delta, attn = self.model(x, mask, value)
+                    
+                    # Compute Delta Target
+                    target_delta = target - x
+                    loss = self.criterion(pred_delta, target_delta)
                     total_loss += loss.item()
                     
                     # Compute Metrics on the first batch of the SCM
