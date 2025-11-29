@@ -55,6 +55,31 @@ This project has evolved through several phases of research and engineering. Her
 
 ISD-CP utilizes a modified Transformer Encoder architecture optimized for tabular data.
 
+```mermaid
+graph TD
+    subgraph "Input Processing"
+        B[Baseline Values] --> Emb[Feature Embedding]
+        I[Intervention Token] --> Emb
+        M[Masks] --> Emb
+        Emb --> Pos[Variable ID Embedding]
+    end
+
+    subgraph "Transformer Core"
+        Pos --> L1[Layer 1: Self-Attention]
+        L1 --> L2[Layer 2: Self-Attention]
+        L2 --> LN["..."]
+        LN --> LN_Final[Layer N: Self-Attention]
+    end
+
+    subgraph "Prediction Head"
+        LN_Final --> MLP[MLP Projection]
+        MLP --> Out[Predicted Post-Intervention State]
+    end
+
+    Pos --> L1
+    LN_Final --> MLP
+```
+
 ### 1. TabPFN-Style Embeddings
 Standard Transformers use linear layers to embed inputs. However, for tabular data, the specific *value* of a number matters (e.g., 0.1 vs 0.9).
 We adopted the **TabPFN** approach:
