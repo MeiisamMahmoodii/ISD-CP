@@ -164,8 +164,13 @@ class Trainer:
                 # Optimization step
                 if (self.global_step + 1) % self.accumulation_steps == 0:
                     # Gradient Clipping
+                    grad_norm = 0.0
                     if self.grad_clip > 0:
-                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
+                        grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
+                    
+                    # Log System Metrics
+                    self.writer.add_scalar("System/GradNorm", grad_norm, self.global_step)
+                    self.writer.add_scalar("System/LR", self.optimizer.param_groups[0]['lr'], self.global_step)
                         
                     self.optimizer.step()
                     self.optimizer.zero_grad()
@@ -181,13 +186,16 @@ class Trainer:
                 # Log batch loss occasionally
                 if self.global_step % 10 == 0:
                     self.writer.add_scalar("Loss/TrainBatch", batch_loss, self.global_step)
-                    self.writer.add_scalar("Loss/TrainBatch", batch_loss, self.global_step)
                     self.writer.add_scalar("Loss/Aux", total_aux_loss / (self.global_step % len(file_content) + 1), self.global_step) # Approx
                     self.writer.add_scalar("Loss/Sparse", total_sparse_loss / (self.global_step % len(file_content) + 1), self.global_step) # Approx
                     # Log progress text
-                    # Log progress text
                     self.writer.add_text("Status", f"Epoch {epoch_idx}: Step {self.global_step}, Loss: {batch_loss:.4f}", self.global_step)
                 
+                # Log Distributions occasionally
+                if self.global_step % 100 == 0:
+                    self.writer.add_histogram("Dist/Delta_Pred", pred_delta, self.global_step)
+                    self.writer.add_histogram("Dist/Delta_True", target_delta, self.global_step)
+                    
                 pbar.set_postfix({'loss': batch_loss})
         
         if self.scheduler:
@@ -196,6 +204,10 @@ class Trainer:
         avg_loss = total_loss / len(self.train_loader)
         self.writer.add_scalar("Loss/TrainEpoch", avg_loss, epoch_idx)
         return avg_loss
+
+    def log_terminal_message(self, message, step):
+        """Logs a text message to TensorBoard."""
+        self.writer.add_text("Logs/Terminal", message, step)
 
     def validate(self, epoch_idx):
         """
@@ -259,11 +271,35 @@ class Trainer:
                             total_f1 += f1
                             num_graphs += 1
                             
-                            # Log Heatmap (only for the first graph of the epoch to avoid spam)
+                            # Log Visualizations (only for the first graph of the epoch)
                             if num_graphs == 1:
+                                # 1. Adjacency Heatmap
                                 fig = plot_adjacency_heatmap(pred_adj, true_adj)
-                                self.writer.add_figure("Val/Adjacency", fig, epoch_idx)
+                                self.writer.add_figure("Analysis/Adjacency", fig, epoch_idx)
                                 plt.close(fig)
+                                
+                                # 2. Scatter Plot (Pred vs True Delta)
+                                fig2, ax = plt.subplots(figsize=(6, 6))
+                                # Flatten and sample to avoid huge plots if large
+                                t_flat = target_delta.cpu().numpy().flatten()
+                                p_flat = pred_delta.cpu().numpy().flatten()
+                                if len(t_flat) > 1000:
+                                    idx = np.random.choice(len(t_flat), 1000, replace=False)
+                                    t_flat = t_flat[idx]
+                                    p_flat = p_flat[idx]
+                                    
+                                ax.scatter(t_flat, p_flat, alpha=0.3)
+                                ax.plot([t_flat.min(), t_flat.max()], [t_flat.min(), t_flat.max()], 'r--') # Identity line
+                                ax.set_xlabel("True Delta")
+                                ax.set_ylabel("Predicted Delta")
+                                ax.set_title(f"Prediction Correlation (Epoch {epoch_idx})")
+                                ax.grid(True)
+                                self.writer.add_figure("Analysis/Pred_vs_True", fig2, epoch_idx)
+                                plt.close(fig2)
+                                
+                                # 3. Histograms
+                                self.writer.add_histogram("Dist/Val_Delta_Pred", pred_delta, epoch_idx)
+                                self.writer.add_histogram("Dist/Val_Delta_True", target_delta, epoch_idx)
                             
                         first_batch = False
                     

@@ -9,6 +9,10 @@ import os
 import logging
 import sys
 
+# Fix for tmux/multiprocessing crash
+# This resolves "RuntimeError: received 0 items of ancdata" when running in tmux
+torch.multiprocessing.set_sharing_strategy('file_system')
+
 # Setup logging
 logging.basicConfig(
     level=logging.INFO,
@@ -168,7 +172,10 @@ def main():
         
         loss = trainer.train_epoch(epoch)
         val_loss, val_shd, val_f1 = trainer.validate(epoch)
-        logger.info(f"Epoch {epoch+1}/{args.epochs} - Train Loss: {loss:.4f} - Val Loss: {val_loss:.4f} - SHD: {val_shd:.2f} - F1: {val_f1:.4f}")
+        
+        log_msg = f"Epoch {epoch+1}/{args.epochs} - Train Loss: {loss:.4f} - Val Loss: {val_loss:.4f} - SHD: {val_shd:.2f} - F1: {val_f1:.4f}"
+        logger.info(log_msg)
+        trainer.log_terminal_message(log_msg, epoch)
         
         # Save Last Checkpoint (Overwrite)
         torch.save(model.state_dict(), os.path.join(args.output_dir, "model_last.pt"))
