@@ -23,28 +23,14 @@ class TabPFNStyleEmbedding(nn.Module):
         x = self.layer_norm(x)
         return x
 
+from src.model.gumbel import GumbelAdjacency
+
 class CausalTransformer(nn.Module):
     """
-    Structure-Agnostic Causal Transformer (ISD-CP).
+    Structure-Agnostic Causal Transformer (ISD-CP) with Gumbel Attention.
     
-    This model predicts the consequences of an intervention on a causal system.
-    It treats the problem as an end-to-end regression task:
-    Input: Baseline State + Intervention Description
-    Output: Post-Intervention State
-    
-    Key Innovation:
-    - It does not require an explicit DAG.
-    - It uses self-attention to implicitly learn the causal structure (dependencies) 
-      between variables.
-    - It uses a "Fixed Reference Frame" via standardized inputs.
-    - **Supervised Attention**: It returns attention weights to be supervised by the ground truth DAG.
-    
-    Input Token Construction:
-    For each variable i, the input token is a sum of:
-    1. FeatureEmb: Embedding of the baseline value (S_baseline).
-    2. VarID: Learnable embedding unique to variable i.
-    3. Mask: Embedding indicating if this variable is the one being intervened on.
-    4. Value: Embedding of the intervention magnitude (z-score).
+    This model explicitly learns a binary Adjacency Matrix (Structure) and uses it
+    to mask the attention in the Transformer (Function).
     """
     def __init__(
         self, 
@@ -55,39 +41,25 @@ class CausalTransformer(nn.Module):
         dim_feedforward: int = 2048, 
         dropout: int = 0.1
     ):
-        """
-        Args:
-            num_vars: Number of variables in the system.
-            d_model: Dimension of the transformer embeddings.
-            nhead: Number of attention heads.
-            num_layers: Number of transformer encoder layers.
-            dim_feedforward: Dimension of the feedforward network inside transformer.
-            dropout: Dropout rate.
-        """
         super().__init__()
         self.num_vars = num_vars
         self.d_model = d_model
-        self.num_layers = num_layers
+        self.nhead = nhead
         
         # 1. Embeddings
-        # Feature Embedding: Project scalar feature to d_model using TabPFN style
         self.feature_emb = TabPFNStyleEmbedding(d_model)
-        
-        # Variable ID Embedding: Learnable vector for each variable
-        # This allows the model to distinguish between "Temperature" and "Pressure"
         self.var_id_emb = nn.Embedding(num_vars, d_model)
-        
-        # Mask Embedding: Project binary mask to d_model
-        # Tells the model: "This is the variable we are poking"
         self.mask_emb = nn.Linear(1, d_model)
-        
-        # Value Embedding: Project standardized intervention value to d_model
-        # Tells the model: "We are setting it to this value (z-score)"
         self.value_emb = TabPFNStyleEmbedding(d_model)
         
-        # 2. Transformer Encoder
-        # We use a ModuleList of TransformerEncoderLayers to manually control the forward pass
-        # and extract attention weights.
+        # Sink Token
+        self.sink_token = nn.Parameter(torch.randn(1, 1, d_model))
+        
+        # 2. Structure Learner (Gumbel Adjacency)
+        # Learns the N x N binary mask
+        self.structure_learner = GumbelAdjacency(d_model)
+        
+        # 3. Transformer Encoder
         self.layers = nn.ModuleList([
             nn.TransformerEncoderLayer(
                 d_model=d_model, 
@@ -99,14 +71,12 @@ class CausalTransformer(nn.Module):
             for _ in range(num_layers)
         ])
         
-        # 3. Output Head
-        # Predicts scalar Z-score for each variable
+        # 4. Output Head
         self.output_head = nn.Linear(d_model, 1)
         
         self._init_weights()
 
     def _init_weights(self):
-        """Initialize weights for better convergence."""
         initrange = 0.1
         self.var_id_emb.weight.data.uniform_(-initrange, initrange)
         self.output_head.bias.data.zero_()
@@ -116,124 +86,81 @@ class CausalTransformer(nn.Module):
 
     def forward(self, x, mask, value):
         """
-        Forward pass of the model.
-        
         Args:
-            x: Baseline features (batch_size, num_vars).
-            mask: Intervention mask (batch_size, num_vars) - 1.0 if intervened, 0.0 otherwise.
-            value: Intervention value (batch_size, num_vars) - Non-zero only at intervened idx.
+            x: (batch, num_vars)
+            mask: (batch, num_vars)
+            value: (batch, num_vars)
             
         Returns:
-            delta_pred: Predicted change from baseline (batch_size, num_vars).
-            avg_attn: Averaged attention weights (batch_size, num_vars, num_vars).
+            delta_pred: (batch, num_vars)
+            adj: (num_vars, num_vars) Learned Adjacency Matrix
         """
         batch_size, seq_len = x.shape
         
-        # Create VarIDs (0 to num_vars-1)
+        # 1. Embeddings
         var_ids = torch.arange(seq_len, device=x.device).unsqueeze(0).expand(batch_size, -1)
-        
-        # Embeddings
-        # Reshape inputs to (batch, seq, 1) for Linear layers
         x_emb = self.feature_emb(x.unsqueeze(-1))
         id_emb = self.var_id_emb(var_ids)
         m_emb = self.mask_emb(mask.unsqueeze(-1))
         v_emb = self.value_emb(value.unsqueeze(-1))
         
-        # Combine embeddings
-        # Token = Feature + VarID + Mask + Value
-        # This summation fuses all information into a single vector per variable
         token = x_emb + id_emb + m_emb + v_emb
         
-        # Transformer Pass with Attention Extraction
+        # 2. Learn Structure (Adjacency)
+        # adj is (batch, num_vars, num_vars) with values in [0, 1]
+        # We pass the embeddings to predict the structure (Amortized)
+        adj = self.structure_learner(token, hard=not self.training) # Hard during inference
+        
+        # Prepend Sink Token
+        sink = self.sink_token.expand(batch_size, -1, -1)
+        token = torch.cat([sink, token], dim=1)
+        
+        # Create Attention Mask from Adjacency
+        # We need a mask for (N+1, N+1)
+        # Sink (0) attends to Sink (0)
+        # Vars (1..N) attend to Sink (0) AND Parents (1..N)
+        
+        # adj is (Batch, N, N). adj[i, j]=1 means i->j.
+        # Attention is (Target, Source).
+        # Target j (index j+1) attends to Source i (index i+1) if adj[i, j]=1.
+        
+        # Base mask for Vars->Vars: (Batch, N, N)
+        vars_mask = (adj.transpose(1, 2) == 0) # True = Block
+        
+        # Full mask: (Batch, N+1, N+1)
+        # Initialize with False (Attend)
+        full_mask = torch.zeros(batch_size, seq_len + 1, seq_len + 1, dtype=torch.bool, device=x.device)
+        
+        # 1. Sink -> Vars (Block)
+        full_mask[:, 0, 1:] = True 
+        
+        # 2. Vars -> Sink (Allow - False) -> Already False
+        
+        # 3. Vars -> Vars (Copy from vars_mask)
+        full_mask[:, 1:, 1:] = vars_mask
+        
+        # Expand for MultiheadAttention: (Batch * nhead, N+1, N+1)
+        attn_mask = full_mask.unsqueeze(1).repeat(1, self.nhead, 1, 1)
+        attn_mask = attn_mask.reshape(batch_size * self.nhead, seq_len + 1, seq_len + 1)
+        
+        # 3. Transformer Pass with Mask
         current_out = token
-        layer_attns = []
         
         for layer in self.layers:
-            # We need to call layer.self_attn manually to get weights
-            # MultiheadAttention forward signature: query, key, value
-            # For self-attention: src, src, src
+            # We pass the same structural mask to all layers
+            # layer(src, src_mask=...)
+            # src_mask shape: (seq, seq) or (batch*num_heads, seq, seq)
             
-            # We assume batch_first=True was passed to encoder layer
-            # layer.self_attn returns (attn_output, attn_output_weights)
-            # We need to pass need_weights=True
+            # Note: nn.TransformerEncoderLayer.forward(src, src_mask=...)
+            # We need to convert boolean mask to float for some versions, or keep bool.
+            # Newer PyTorch supports bool mask (True = Ignore).
             
-            # Note: nn.TransformerEncoderLayer implementation details:
-            # x = src
-            # if self.norm_first:
-            #     x = x + self._sa_block(self.norm1(x))
-            #     x = x + self._ff_block(self.norm2(x))
-            # else:
-            #     x = self.norm1(x + self._sa_block(x))
-            #     x = self.norm2(x + self._ff_block(x))
+            current_out = layer(current_out, src_mask=attn_mask)
             
-            # _sa_block calls self.self_attn
-            
-            # To correctly replicate the layer logic AND get weights, we have to be careful.
-            # It's safer to just rely on the fact that we want the weights from the *current* representation.
-            # We can run self_attn separately to get weights, and then run the layer normally.
-            # This adds a bit of compute overhead (running attention twice) but ensures correctness of the forward pass.
-            
-            # 1. Extract Attention Weights
-            # We use the input to the layer (or normalized input if norm_first)
-            # Default TransformerEncoderLayer is norm_first=False (Post-LN).
-            # So input to attention is just `current_out`.
-            
-            with torch.no_grad(): # We don't need gradients for the extraction pass if we only use it for logging/aux loss target?
-                # Actually we DO need gradients if we want to supervise the attention weights!
-                # So we cannot use no_grad.
-                pass
-
-            # However, running it twice is inefficient and might cause issues if we optimize the "extraction" path
-            # but the "forward" path uses a different computation graph (though sharing weights).
-            
-            # Better approach:
-            # Manually implement the layer logic here.
-            # Assuming Post-LN (default):
-            # x = self.norm1(x + self._sa_block(x))
-            # x = self.norm2(x + self._ff_block(x))
-            
-            src = current_out
-            
-            # Self Attention Block
-            # attn_output, attn_weights = layer.self_attn(src, src, src, need_weights=True, average_attn_weights=True)
-            # But layer.self_attn expects (seq, batch, dim) if batch_first=False.
-            # We set batch_first=True.
-            
-            attn_output, attn_weights = layer.self_attn(
-                src, src, src,
-                need_weights=True,
-                average_attn_weights=True # Returns (batch, seq, seq)
-            )
-            
-            # Dropout and Residual
-            src = src + layer.dropout1(attn_output)
-            src = layer.norm1(src)
-            
-            # Feed Forward Block
-            # layer.linear1, layer.activation, layer.dropout, layer.linear2, layer.dropout2
-            src2 = layer.linear2(layer.dropout(layer.activation(layer.linear1(src))))
-            src = src + layer.dropout2(src2)
-            src = layer.norm2(src)
-            
-            current_out = src
-            layer_attns.append(attn_weights)
-            
-        # Stack and average across layers
-        # Shape: (num_layers, batch, seq, seq)
-        # Stack and average across layers
-        # Shape: (num_layers, batch, seq, seq)
-        # all_attns = torch.stack(layer_attns)
-        # avg_attn = torch.mean(all_attns, dim=0) # Average over layers
+        # 4. Prediction
+        delta_pred = self.output_head(current_out[:, 1:, :]).squeeze(-1)
         
-        # Use LAST layer attention for structure extraction
-        # The last layer represents the final "decision" or "structure" of the model.
-        avg_attn = layer_attns[-1]
-        
-        # Prediction
-        # Map back from d_model to scalar output (Delta)
-        delta_pred = self.output_head(current_out).squeeze(-1)
-        
-        return delta_pred, avg_attn
+        return delta_pred, adj
 
 if __name__ == "__main__":
     # Test

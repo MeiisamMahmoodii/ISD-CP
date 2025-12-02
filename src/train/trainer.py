@@ -28,7 +28,8 @@ class Trainer:
         lambda_aux: float = 0.1, # Weight for auxiliary attention loss
         lambda_sparse: float = 0.01, # Weight for sparsity penalty
         edge_threshold: float = 0.1, # Threshold for edge detection
-        grad_clip: float = 1.0   # Gradient clipping value
+        grad_clip: float = 1.0,   # Gradient clipping value
+        epochs: int = 100 # Total epochs for annealing
     ):
         self.model = model.to(device)
         self.train_loader = train_loader
@@ -42,6 +43,7 @@ class Trainer:
         self.lambda_sparse = lambda_sparse
         self.edge_threshold = edge_threshold
         self.grad_clip = grad_clip
+        self.epochs = epochs
         
         self.criterion = nn.MSELoss()
         self.writer = SummaryWriter(log_dir=log_dir)
@@ -58,7 +60,9 @@ class Trainer:
         total_aux_loss = 0.0
         total_sparse_loss = 0.0
         
-        pbar = tqdm(self.train_loader, desc="Training")
+        pbar = tqdm(self.train_loader, desc="Training", dynamic_ncols=True)
+        postfix_dict = {}
+        
         for batch in pbar:
             # Handle nested list structure from DataLoader
             file_content = batch
@@ -66,8 +70,9 @@ class Trainer:
                  file_content = batch[0]
             
             # Iterate over the mini-batches contained in the loaded file/chunk
-            inner_pbar = tqdm(file_content, desc="Processing SCM", leave=False)
-            for mini_batch in inner_pbar:
+            # inner_pbar = tqdm(file_content, desc="Processing SCM", leave=False)
+            # Using just one bar might be cleaner if inner loop is fast
+            for mini_batch in file_content:
                 x = mini_batch['x'].to(self.device)
                 mask = mini_batch['mask'].to(self.device)
                 value = mini_batch['value'].to(self.device)
@@ -95,6 +100,18 @@ class Trainer:
                 
                 self.optimizer.zero_grad()
                 
+                # Anneal Gumbel Temperature
+                # 1.0 -> 0.1 over epochs
+                if hasattr(self.model, 'structure_learner') and hasattr(self.model.structure_learner, 'temperature'):
+                    # Exponential decay: tau = tau_start * (tau_end / tau_start) ^ (epoch / max_epochs)
+                    tau_start = 1.0
+                    tau_end = 0.1
+                    progress = epoch_idx / self.epochs
+                    new_tau = tau_start * (tau_end / tau_start) ** progress
+                    self.model.structure_learner.temperature = new_tau
+                    
+                    self.writer.add_scalar("System/Gumbel_Tau", new_tau, epoch_idx)
+
                 for i in range(num_micro_batches):
                     start_idx = i * self.micro_batch_size
                     end_idx = min((i + 1) * self.micro_batch_size, batch_size)
@@ -105,50 +122,59 @@ class Trainer:
                     target_micro = target[start_idx:end_idx]
                     
                     # Forward pass
-                    pred_delta, attn_micro = self.model(x_micro, mask_micro, value_micro)
+                    pred_delta, adj = self.model(x_micro, mask_micro, value_micro)
                     
                     # Compute Prediction Loss (Delta Reward)
-                    # Target is the CHANGE from baseline
                     target_delta = target_micro - x_micro
                     loss_pred = self.criterion(pred_delta, target_delta)
                     
-                    # Compute Auxiliary Loss (Supervised Attention)
+                    # Compute Structure Loss (Supervised Adjacency)
                     loss_aux = torch.tensor(0.0, device=self.device)
                     if true_adj is not None:
-                        # true_adj is (num_vars, num_vars) usually, or (batch, num_vars, num_vars) if repeated?
-                        # In OnlineCausalDataset, adj is (num_vars, num_vars) repeated for each sample in batch?
-                        # No, 'adj' is added to batch_data.
-                        # If collate_fn stacks them, it becomes (batch, num_vars, num_vars).
-                        # Let's check dimensions.
-                        
                         if true_adj.ndim == 2:
-                            # Expand to match micro batch size
-                            target_adj = true_adj.unsqueeze(0).expand(pred_delta.shape[0], -1, -1)
+                            target_adj = true_adj.unsqueeze(0).expand(adj.shape[0], -1, -1)
                         else:
-                            # Assuming it's (batch, N, N)
                             target_adj = true_adj[start_idx:end_idx]
-                            
-                        # attn_micro is (batch, N, N)
-                        # We want attn to match adjacency (transposed? A_ij=1 if i->j. Attn_ji means j attends to i)
-                        # If j attends to i, then i causes j.
-                        # So Attn_ji ~= Adj_ij.
-                        # Attn matrix: rows are queries (targets), cols are keys (sources).
-                        # Attn[j, i] = weight of i on j.
-                        # Adj[i, j] = 1 if i -> j.
-                        # So we want Attn[j, i] to be high if Adj[i, j] is 1.
-                        # So Target Attn = Adj.T
                         
-                        target_attn = target_adj.transpose(1, 2)
-                        loss_aux = F.mse_loss(attn_micro, target_attn)
+                        # adj is (Batch, N, N) - Wait, model returns adj from GumbelAdjacency
+                        # GumbelAdjacency returns (Batch, N, N).
+                        # The Sink Token is added in Transformer Forward, but NOT to the adjacency matrix itself.
+                        # The Transformer uses the Sink Token for masking, but the Gumbel module only predicts N x N.
+                        # So 'adj' returned by model is still (Batch, N, N).
+                        # So we don't need to slice it!
+                        
+                        # BCE Loss for binary edges
+                        loss_aux = F.binary_cross_entropy(adj, target_adj)
                     
-                        loss_aux = F.mse_loss(attn_micro, target_attn)
+                    # Compute Sparsity Penalty (L1 on Adjacency)
+                    loss_sparse = torch.mean(torch.abs(adj))
+
+                    # Compute DAG Constraint (Trace Exponential)
+                    # h(A) = tr(e^A) - d = 0
+                    # We need to ensure A has zero diagonal for this to work well, or handle it.
+                    # GumbelAdjacency already masks diagonal to 0.÷
+                    # We compute this per sample and average? Or average A then compute?
+                    # Usually computed on the "average" A or per sample.
+                    # Since A is sample-dependent here (contextual), we compute per sample.
                     
-                    # Compute Sparsity Penalty (L1 on Attention)
-                    # We want the attention matrix to be sparse (few edges)
-                    loss_sparse = torch.mean(torch.abs(attn_micro))
+                    # Matrix Exp is expensive. We can use polynomial approximation or just run it.
+                    # For small graphs (20 vars), it's fast.
+                    
+                    # adj is (Batch, N, N)
+                    # torch.matrix_exp supports batches
+                    if adj.shape[1] <= 50: # Only run for small graphs to avoid OOM/Slow
+                        expm_A = torch.matrix_exp(adj)
+                        h_A = torch.diagonal(expm_A, dim1=-2, dim2=-1).sum(-1) - adj.shape[1]
+                        loss_dag = torch.mean(h_A * h_A) # Quadratic penalty
+                    else:
+                        loss_dag = torch.tensor(0.0, device=self.device)
 
                     # Total Loss
-                    loss_micro = loss_pred + self.lambda_aux * loss_aux + self.lambda_sparse * loss_sparse
+                    # We add loss_dag with a coefficient (rho) which we can increase over time?
+                    # For now, just a fixed weight.
+                    lambda_dag = 0.1 
+                    
+                    loss_micro = loss_pred + self.lambda_aux * loss_aux + self.lambda_sparse * loss_sparse + lambda_dag * loss_dag
                     
                     # Normalize loss for accumulation
                     weight = (end_idx - start_idx) / batch_size
@@ -164,39 +190,89 @@ class Trainer:
                 # Optimization step
                 if (self.global_step + 1) % self.accumulation_steps == 0:
                     # Gradient Clipping
+                    if self.grad_clip > 0:
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
+                    
+                    # Check for NaNs in gradients
+                    has_nan = False
+                    for name, param in self.model.named_parameters():
+                        if param.grad is not None:
+                            if torch.isnan(param.grad).any() or torch.isinf(param.grad).any():
+                                has_nan = True
+                                # print(f"WARNING: NaN gradient in {name}")
+                                break
+                    
+                    if not has_nan:
+                        self.optimizer.step()
+                        if self.scheduler:
+                            self.scheduler.step()
+                    else:
+                        print(f"Skipping step {self.global_step} due to NaN gradients.")
+                        
+                    self.optimizer.zero_grad()
+                    self.global_step += 1
                     grad_norm = 0.0
                     if self.grad_clip > 0:
                         grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
                     
-                    # Log System Metrics
-                    self.writer.add_scalar("System/GradNorm", grad_norm, self.global_step)
-                    self.writer.add_scalar("System/LR", self.optimizer.param_groups[0]['lr'], self.global_step)
+                    # Log to TensorBoard
+                    if self.global_step % 50 == 0:
+                        self.writer.add_scalar("Train/Loss", loss_micro.item(), self.global_step)
+                        self.writer.add_scalar("Train/Pred_Loss", loss_pred.item(), self.global_step)
+                        self.writer.add_scalar("Train/Aux_Loss", loss_aux.item(), self.global_step)
+                        self.writer.add_scalar("Train/Sparse_Loss", loss_sparse.item(), self.global_step)
+                        self.writer.add_scalar("System/GradNorm", grad_norm, self.global_step)
+                        self.writer.add_scalar("System/LR", self.optimizer.param_groups[0]['lr'], self.global_step)
                         
-                    self.optimizer.step()
-                    self.optimizer.zero_grad()
-                    
-                    # Step scheduler if it's per-step (e.g. OneCycleLR)
-                    # Assuming scheduler is per-epoch for now, or handled outside.
-                    # But if it's CosineAnnealingWarmRestarts, it might be per batch?
-                    # Let's stick to per-epoch for now unless specified.
-                
-                total_loss += batch_loss
-                self.global_step += 1
-                
-                # Log batch loss occasionally
-                if self.global_step % 10 == 0:
-                    self.writer.add_scalar("Loss/TrainBatch", batch_loss, self.global_step)
-                    self.writer.add_scalar("Loss/Aux", total_aux_loss / (self.global_step % len(file_content) + 1), self.global_step) # Approx
-                    self.writer.add_scalar("Loss/Sparse", total_sparse_loss / (self.global_step % len(file_content) + 1), self.global_step) # Approx
-                    # Log progress text
-                    self.writer.add_text("Status", f"Epoch {epoch_idx}: Step {self.global_step}, Loss: {batch_loss:.4f}", self.global_step)
-                
-                # Log Distributions occasionally
-                if self.global_step % 100 == 0:
-                    self.writer.add_histogram("Dist/Delta_Pred", pred_delta, self.global_step)
-                    self.writer.add_histogram("Dist/Delta_True", target_delta, self.global_step)
-                    
-                pbar.set_postfix({'loss': batch_loss})
+                        # Compute Metrics for Progress Bar (on first sample of batch)
+                        with torch.no_grad():
+                            # Edges
+                            probs = torch.sigmoid(adj)
+                            num_edges = (probs > 0.5).float().sum(dim=(1, 2)).mean().item()
+                            self.writer.add_scalar("Train/Avg_Edge_Count", num_edges, self.global_step)
+                            
+                            # SHD/F1 (CPU intensive, do only for one sample)
+                            if true_adj is not None:
+                                # true_adj is (N, N) for the current SCM
+                                t_adj = true_adj.cpu().numpy()
+                                p_adj = (probs[0] > 0.5).float().cpu().numpy()
+                                
+                                shd = compute_shd(p_adj, t_adj)
+                                f1 = compute_f1(p_adj, t_adj)
+                                
+                                self.writer.add_scalar("Train/SHD", shd, self.global_step)
+                                self.writer.add_scalar("Train/F1", f1, self.global_step)
+                                
+                                # Update persistent metrics
+                                postfix_dict.update({
+                                    'shd': f"{shd}",
+                                    'f1': f"{f1:.2f}",
+                                    'edges': f"{num_edges:.1f}",
+                                    'grad': f"{grad_norm:.1f}",
+                                    'lr': f"{self.optimizer.param_groups[0]['lr']:.1e}"
+                                })
+                            else:
+                                postfix_dict.update({
+                                    'edges': f"{num_edges:.1f}",
+                                    'grad': f"{grad_norm:.1f}"
+                                })
+
+            total_loss += batch_loss
+            self.global_step += 1
+            
+            # Always update loss in postfix_dict
+            postfix_dict['loss'] = f"{batch_loss:.2f}"
+            pbar.set_postfix(postfix_dict)
+            
+            # Log batch loss occasionally
+            if self.global_step % 50 == 0:
+                # Log progress text (Terminal Output in TensorBoard)
+                self.writer.add_text("Logs/Terminal", f"Epoch {epoch_idx}: Step {self.global_step}, Loss: {batch_loss:.4f}", self.global_step)
+            
+            # Log Distributions occasionally
+            if self.global_step % 200 == 0:
+                self.writer.add_histogram("Dist/Delta_Pred", pred_delta, self.global_step)
+                self.writer.add_histogram("Dist/Delta_True", target_delta, self.global_step)
         
         if self.scheduler:
             self.scheduler.step()
@@ -240,7 +316,7 @@ class Trainer:
                         value = value.squeeze(0)
                         target = target.squeeze(0)
                     
-                    pred_delta, attn = self.model(x, mask, value)
+                    pred_delta, adj = self.model(x, mask, value)
                     
                     # Compute Delta Target
                     target_delta = target - x
@@ -253,10 +329,27 @@ class Trainer:
                         if true_adj.ndim == 3 and true_adj.shape[0] == 1:
                             true_adj = true_adj[0]
                             
-                        # Extract predicted DAG from attention
-                        # attn is (batch, N, N). Use the first sample or average?
-                        # extract_attention_dag handles averaging/single sample
-                        pred_adj = extract_attention_dag(attn, threshold=self.edge_threshold)
+                        # Extract predicted DAG from Gumbel Adjacency
+                        # adj is (batch, N, N). Use the first sample or average?
+                        # Since GumbelAdjacency is contextual (input dependent? No, it's global parameters in this implementation!)
+                        # Wait, my implementation of GumbelAdjacency has `self.logits` as a Parameter.
+                        # So it learns ONE global graph?
+                        # The user's problem is "Structure Discovery" which usually implies input-dependent if it's "Amortized".
+                        # BUT, the `OnlineCausalDataset` generates NEW SCMs every epoch.
+                        # If `GumbelAdjacency` learns ONE graph, it will fail because the graph changes every sample!
+                        
+                        # CRITICAL REALIZATION:
+                        # The current `GumbelAdjacency` learns a STATIC graph.
+                        # But the dataset provides DYNAMIC graphs (different for each sample).
+                        # The model needs to PREDICT the graph from the input `x`.
+                        
+                        # I need to change `GumbelAdjacency` to be INPUT-DEPENDENT (Amortized).
+                        # It should take `x` (embeddings) and predict `adj`.
+                        
+                        # Let's finish this replace first, then fix the model.
+                        
+                        pred_adj_soft = adj[0].detach().cpu().numpy()
+                        pred_adj = (pred_adj_soft > 0.5).astype(int)
                         
                         # Debug shapes if mismatch
                         if pred_adj.shape != true_adj.shape:
@@ -298,8 +391,12 @@ class Trainer:
                                 plt.close(fig2)
                                 
                                 # 3. Histograms
-                                self.writer.add_histogram("Dist/Val_Delta_Pred", pred_delta, epoch_idx)
-                                self.writer.add_histogram("Dist/Val_Delta_True", target_delta, epoch_idx)
+                                if torch.isnan(pred_delta).any() or torch.isinf(pred_delta).any():
+                                    print(f"WARNING: NaNs/Infs detected in pred_delta at epoch {epoch_idx}!")
+                                    print(f"pred_delta range: [{pred_delta.min()}, {pred_delta.max()}]")
+                                else:
+                                    self.writer.add_histogram("Dist/Val_Delta_Pred", pred_delta, epoch_idx)
+                                    self.writer.add_histogram("Dist/Val_Delta_True", target_delta, epoch_idx)
                             
                         first_batch = False
                     

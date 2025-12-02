@@ -71,6 +71,13 @@ def main():
     if not args.no_tensorboard:
         import subprocess
         import time
+        import socket
+        
+        def find_free_port():
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.bind(('', 0))
+                return s.getsockname()[1]
+        
         logger.info("Launching TensorBoard...")
         tb_log_dir = os.path.join(args.output_dir, "logs")
         
@@ -81,10 +88,14 @@ def main():
             
         # Run in background
         try:
-            subprocess.Popen([tb_executable, "--logdir", tb_log_dir, "--port", "6006"])
+            port = find_free_port()
+            subprocess.Popen([tb_executable, "--logdir", tb_log_dir, "--port", str(port)])
             time.sleep(2) # Give it a sec
+            logger.info(f"TensorBoard launched at http://localhost:{port}")
         except FileNotFoundError:
             logger.warning("TensorBoard executable not found. Skipping auto-launch.")
+        except Exception as e:
+            logger.warning(f"Failed to launch TensorBoard: {e}")
     
     # 1. Data
     # Use OnlineCausalDataset for infinite/large-scale data without storage
@@ -155,7 +166,8 @@ def main():
         lambda_aux=args.lambda_aux,
         lambda_sparse=args.lambda_sparse,
         edge_threshold=args.edge_threshold,
-        grad_clip=args.grad_clip
+        grad_clip=args.grad_clip,
+        epochs=args.epochs
     )
     
     # 5. Loop

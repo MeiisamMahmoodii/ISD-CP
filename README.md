@@ -48,6 +48,16 @@ This project has evolved through several phases of research and engineering. Her
 -   **Target**: For non-descendants, the target is exactly **0**.
 -   **Impact**: The model *cannot* just copy the input. To get a low loss, it MUST identify which variables change (descendants) and predict the magnitude of that change.
 **Outcome**: **Breakthrough**. This acted as a dense reward signal, drastically improving causal discovery and prediction accuracy.
+51: 
+52: ### Phase V: Explicit Structure Learning (Gumbel Attention)
+53: **Goal**: Solve the "Non-Existent Edges" problem (High SHD, Low F1).
+54: **Problem**: Implicit attention supervision was too soft. The model "hallucinated" edges because Softmax forces nodes to attend to *something*, even if they have no parents.
+55: **Action**: **Amortized Gumbel Attention**.
+56: **Mechanism**:
+57: -   **Sink Token**: Added a "null" token for root nodes to attend to.
+58: -   **Hard Structure**: Replaced Softmax with **Gumbel-Sigmoid** to learn a binary Adjacency Matrix $A$.
+59: -   **Masking**: The Transformer is *forced* to use $A$ as a hard mask.
+60: **Outcome**: The model now learns **Binary Graphs** (Edge/No-Edge) directly, allowing for precise structure discovery and significantly higher F1 scores.
 
 ---
 

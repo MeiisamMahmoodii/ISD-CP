@@ -134,7 +134,7 @@ class OnlineCausalDataset(Dataset):
         processor.fit(baseline_data)
         
         # 4. Generate Interventions
-        intervention_vals = [-5.0, -2.0, 0.0, 2.0, 5.0]
+        intervention_vals = [-20.0, -10.0, -5.0, 5.0, 10.0, 20.0]
         num_int_nodes = max(1, int(current_num_vars * self.intervention_fraction))
         int_nodes = torch.randperm(current_num_vars)[:num_int_nodes].tolist()
         
