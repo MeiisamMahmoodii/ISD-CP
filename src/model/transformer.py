@@ -23,14 +23,17 @@ class TabPFNStyleEmbedding(nn.Module):
         x = self.layer_norm(x)
         return x
 
-from src.model.gumbel import GumbelAdjacency
+
 
 class CausalTransformer(nn.Module):
     """
-    Structure-Agnostic Causal Transformer (ISD-CP) with Gumbel Attention.
+    Structure-Agnostic Causal Transformer (ISD-CP) with TabICL-style Encoder.
     
-    This model explicitly learns a binary Adjacency Matrix (Structure) and uses it
-    to mask the attention in the Transformer (Function).
+    This model uses an interleaved sequence of Feature and Value tokens:
+    [Feature1, Value1, Feature2, Value2, ...]
+    
+    It does NOT learn an explicit adjacency matrix anymore. It relies on full
+    attention to learn causal mechanisms.
     """
     def __init__(
         self, 
@@ -44,34 +47,31 @@ class CausalTransformer(nn.Module):
         super().__init__()
         self.num_vars = num_vars
         self.d_model = d_model
-        self.nhead = nhead
         
         # 1. Embeddings
-        self.feature_emb = TabPFNStyleEmbedding(d_model)
+        # Feature Token: Just the ID
         self.var_id_emb = nn.Embedding(num_vars, d_model)
-        self.mask_emb = nn.Linear(1, d_model)
+        
+        # Value Token: Value + Type (Observed vs Intervened)
         self.value_emb = TabPFNStyleEmbedding(d_model)
+        self.type_emb = nn.Embedding(2, d_model) # 0=Observed, 1=Intervened
         
-        # Sink Token
-        self.sink_token = nn.Parameter(torch.randn(1, 1, d_model))
-        
-        # 2. Structure Learner (Gumbel Adjacency)
-        # Learns the N x N binary mask
-        self.structure_learner = GumbelAdjacency(d_model)
-        
-        # 3. Transformer Encoder
+        # 2. Transformer Encoder
+        # Sequence length will be 2 * num_vars
         self.layers = nn.ModuleList([
             nn.TransformerEncoderLayer(
                 d_model=d_model, 
                 nhead=nhead, 
                 dim_feedforward=dim_feedforward, 
                 dropout=dropout,
-                batch_first=True
+                batch_first=True,
+                norm_first=True # Pre-Norm is usually better
             )
             for _ in range(num_layers)
         ])
         
-        # 4. Output Head
+        # 3. Output Head
+        # We predict delta for each variable based on its Value Token output
         self.output_head = nn.Linear(d_model, 1)
         
         self._init_weights()
@@ -79,88 +79,76 @@ class CausalTransformer(nn.Module):
     def _init_weights(self):
         initrange = 0.1
         self.var_id_emb.weight.data.uniform_(-initrange, initrange)
+        self.type_emb.weight.data.uniform_(-initrange, initrange)
         self.output_head.bias.data.zero_()
         self.output_head.weight.data.uniform_(-initrange, initrange)
-        self.mask_emb.weight.data.uniform_(-initrange, initrange)
-        self.mask_emb.bias.data.zero_()
 
     def forward(self, x, mask, value):
         """
         Args:
-            x: (batch, num_vars)
-            mask: (batch, num_vars)
-            value: (batch, num_vars)
+            x: (batch, num_vars) - Baseline values
+            mask: (batch, num_vars) - 1.0 if intervened, 0.0 if observed
+            value: (batch, num_vars) - Intervention values (only valid where mask=1)
             
         Returns:
             delta_pred: (batch, num_vars)
-            adj: (num_vars, num_vars) Learned Adjacency Matrix
+            adj: None (Compatibility return)
         """
-        batch_size, seq_len = x.shape
+        batch_size, num_vars = x.shape
+        device = x.device
         
-        # 1. Embeddings
-        var_ids = torch.arange(seq_len, device=x.device).unsqueeze(0).expand(batch_size, -1)
-        x_emb = self.feature_emb(x.unsqueeze(-1))
-        id_emb = self.var_id_emb(var_ids)
-        m_emb = self.mask_emb(mask.unsqueeze(-1))
-        v_emb = self.value_emb(value.unsqueeze(-1))
+        # 1. Prepare Inputs
+        # Combine baseline and intervention values
+        # If mask=1, use value. If mask=0, use x.
+        final_values = x * (1 - mask) + value * mask
         
-        token = x_emb + id_emb + m_emb + v_emb
+        # Type IDs: 0 for Observed, 1 for Intervened
+        type_ids = mask.long()
         
-        # 2. Learn Structure (Adjacency)
-        # adj is (batch, num_vars, num_vars) with values in [0, 1]
-        # We pass the embeddings to predict the structure (Amortized)
-        adj = self.structure_learner(token, hard=not self.training) # Hard during inference
+        # Variable IDs: 0 to N-1
+        var_ids = torch.arange(num_vars, device=device).unsqueeze(0).expand(batch_size, -1)
         
-        # Prepend Sink Token
-        sink = self.sink_token.expand(batch_size, -1, -1)
-        token = torch.cat([sink, token], dim=1)
+        # 2. Create Tokens
+        # Feature Tokens: [Batch, N, D]
+        f_tokens = self.var_id_emb(var_ids)
         
-        # Create Attention Mask from Adjacency
-        # We need a mask for (N+1, N+1)
-        # Sink (0) attends to Sink (0)
-        # Vars (1..N) attend to Sink (0) AND Parents (1..N)
+        # Value Tokens: [Batch, N, D]
+        v_emb = self.value_emb(final_values.unsqueeze(-1))
+        t_emb = self.type_emb(type_ids)
+        v_tokens = v_emb + t_emb
         
-        # adj is (Batch, N, N). adj[i, j]=1 means i->j.
-        # Attention is (Target, Source).
-        # Target j (index j+1) attends to Source i (index i+1) if adj[i, j]=1.
+        # 3. Interleave Tokens
+        # We want: [F1, V1, F2, V2, ...]
+        # Stack along new dim: [Batch, N, 2, D]
+        # Then flatten: [Batch, 2*N, D]
+        stacked = torch.stack([f_tokens, v_tokens], dim=2)
+        tokens = stacked.flatten(1, 2)
         
-        # Base mask for Vars->Vars: (Batch, N, N)
-        vars_mask = (adj.transpose(1, 2) == 0) # True = Block
-        
-        # Full mask: (Batch, N+1, N+1)
-        # Initialize with False (Attend)
-        full_mask = torch.zeros(batch_size, seq_len + 1, seq_len + 1, dtype=torch.bool, device=x.device)
-        
-        # 1. Sink -> Vars (Block)
-        full_mask[:, 0, 1:] = True 
-        
-        # 2. Vars -> Sink (Allow - False) -> Already False
-        
-        # 3. Vars -> Vars (Copy from vars_mask)
-        full_mask[:, 1:, 1:] = vars_mask
-        
-        # Expand for MultiheadAttention: (Batch * nhead, N+1, N+1)
-        attn_mask = full_mask.unsqueeze(1).repeat(1, self.nhead, 1, 1)
-        attn_mask = attn_mask.reshape(batch_size * self.nhead, seq_len + 1, seq_len + 1)
-        
-        # 3. Transformer Pass with Mask
-        current_out = token
+        # 4. Transformer Pass
+        # No mask needed (Full Attention)
+        current_out = tokens
         
         for layer in self.layers:
-            # We pass the same structural mask to all layers
-            # layer(src, src_mask=...)
-            # src_mask shape: (seq, seq) or (batch*num_heads, seq, seq)
+            current_out = layer(current_out)
             
-            # Note: nn.TransformerEncoderLayer.forward(src, src_mask=...)
-            # We need to convert boolean mask to float for some versions, or keep bool.
-            # Newer PyTorch supports bool mask (True = Ignore).
-            
-            current_out = layer(current_out, src_mask=attn_mask)
-            
-        # 4. Prediction
-        delta_pred = self.output_head(current_out[:, 1:, :]).squeeze(-1)
+        # 5. Extract Outputs
+        # We want predictions for the variables.
+        # Should we use the output of Feature Token or Value Token?
+        # Usually Value Token contains the "state" after processing.
+        # Let's use Value Token outputs (indices 1, 3, 5...)
+        # tokens shape: [F0, V0, F1, V1, ...]
+        # V indices: 1, 3, 5...
         
-        return delta_pred, adj
+        # Reshape back to [Batch, N, 2, D]
+        out_reshaped = current_out.view(batch_size, num_vars, 2, self.d_model)
+        
+        # Take the Value token output (index 1)
+        v_out = out_reshaped[:, :, 1, :] # [Batch, N, D]
+        
+        # 6. Prediction
+        delta_pred = self.output_head(v_out).squeeze(-1)
+        
+        return delta_pred, None
 
 if __name__ == "__main__":
     # Test

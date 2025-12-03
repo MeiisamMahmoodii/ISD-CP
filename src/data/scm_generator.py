@@ -25,7 +25,7 @@ class SCMGenerator:
     def __init__(
         self, 
         num_vars: int, 
-        edge_prob: float = 0.3, 
+        edge_prob: float = 0.1, 
         mechanism_type: str = 'mixed',
         seed: int = 42
     ):

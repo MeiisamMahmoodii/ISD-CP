@@ -59,6 +59,18 @@ This project has evolved through several phases of research and engineering. Her
 59: -   **Masking**: The Transformer is *forced* to use $A$ as a hard mask.
 60: **Outcome**: The model now learns **Binary Graphs** (Edge/No-Edge) directly, allowing for precise structure discovery and significantly higher F1 scores.
 
+### Phase VI: TabICL Encoder & Pure Causal Prediction (Current Architecture)
+**Goal**: Improve generalization and zero-shot capabilities by separating "Variable Identity" from "Variable Value".
+**Action**: **TabICL-Style Interleaved Encoder**.
+**Mechanism**:
+-   **Interleaved Sequence**: Input is now a sequence of pairs: `[FeatureToken_1, ValueToken_1, FeatureToken_2, ValueToken_2, ...]`.
+-   **Tokens**:
+    -   **Feature Token**: Embedding of the Variable ID (What is this?).
+    -   **Value Token**: Embedding of the Value + Type (Observed vs. Intervened).
+-   **Full Attention**: We removed the explicit DAG learning and masking. The model now uses full bidirectional attention to learn causal mechanisms implicitly.
+-   **Loss**: Switched to **HuberLoss** for robust regression, removing all DAG-related auxiliary losses.
+**Outcome**: A more robust, scalable model that focuses purely on predicting intervention effects, with an architecture closer to Large Language Models (LLMs) for tabular data.
+
 ---
 
 ## 🏗️ Detailed Architecture
@@ -90,24 +102,26 @@ graph TD
     LN_Final --> MLP
 ```
 
-### 1. TabPFN-Style Embeddings
-Standard Transformers use linear layers to embed inputs. However, for tabular data, the specific *value* of a number matters (e.g., 0.1 vs 0.9).
-We adopted the **TabPFN** approach:
--   **Input**: A single scalar value $x$.
--   **Mechanism**: A small MLP `Linear(1 -> d*2) -> GELU -> Linear(d*2 -> d)`.
--   **Why?**: This allows the model to learn non-linear representations of scalar values, enabling it to distinguish between "low", "medium", and "high" values in a soft, differentiable way.
+### 1. TabICL-Style Interleaved Encoder
+Instead of summing embeddings, we now treat the table as a sequence of tokens, similar to how LLMs process text.
+-   **Sequence**: `[F1, V1, F2, V2, ..., Fn, Vn]` (Length $2N$).
+-   **Feature Token ($F_i$)**: Represents the *identity* of the variable (e.g., "Column 1").
+-   **Value Token ($V_i$)**: Represents the *state* of the variable (Value + Type).
+    -   **Value Embedding**: TabPFN-style MLP for scalar values.
+    -   **Type Embedding**: Learned embedding for "Observed" vs "Intervened".
 
 ### 2. The Delta Output Head
-The final layer of the model is a linear projection `Linear(d_model -> 1)`.
--   **Output**: $\hat{\delta}_j$ (Predicted change for variable $j$).
--   **Final Prediction**: $\hat{y}_j = x_j + \hat{\delta}_j$.
--   **Loss Function**: $L = || \hat{\delta} - (y_{true} - x_{base}) ||^2$.
+The final layer projects the output of each **Value Token** to a scalar prediction.
+-   **Input**: Output state of $V_i$ from the Transformer.
+-   **Output**: $\hat{\delta}_i$ (Predicted change).
+-   **Loss Function**: **HuberLoss** (Robust Regression).
+    -   $L = \text{Huber}(\hat{\delta} - \delta_{true})$.
+    -   Robust to outliers and prevents exploding gradients.
 
-### 3. Implicit DAG Extraction
-We extract the attention weights from the **last layer** of the Transformer.
--   **Interpretation**: $A_{ij}$ represents how much variable $j$ "attends" to variable $i$.
--   **Causal Meaning**: If $j$ attends to $i$, it implies $i$ is a cause of $j$.
--   **Sparsity**: We apply an L1 penalty to these weights to encourage a sparse graph (Occam's Razor).
+### 3. Implicit Causal Mechanism
+We no longer explicitly reconstruct the DAG. Instead, the Transformer uses **Full Self-Attention** to learn the causal graph implicitly.
+-   To predict the change in $V_j$, the model attends to all other Feature and Value tokens.
+-   It learns to attend to "Causes" ($V_i$) to predict "Effects" ($V_j$).
 
 ---
 

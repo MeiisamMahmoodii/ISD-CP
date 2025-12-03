@@ -50,12 +50,13 @@ def main():
     parser.add_argument("--accumulation_steps", type=int, default=1, help="Gradient accumulation steps")
     parser.add_argument("--micro_batch_size", type=int, default=20, help="Micro batch size to avoid OOM")
     parser.add_argument("--no_tensorboard", action="store_true", help="Disable auto-launch of TensorBoard")
-    parser.add_argument("--lambda_aux", type=float, default=0.1, help="Weight for auxiliary attention loss")
-    parser.add_argument("--lambda_sparse", type=float, default=0.01, help="Weight for L1 sparsity penalty on attention")
+    parser.add_argument("--lambda_aux", type=float, default=0.0, help="Weight for auxiliary attention loss")
+    parser.add_argument("--lambda_sparse", type=float, default=0.0, help="Weight for L1 sparsity penalty on attention")
     parser.add_argument("--edge_threshold", type=float, default=0.1, help="Threshold for converting attention to edges")
     parser.add_argument("--reuse_factor", type=int, default=1, help="Reuse same SCMs for N epochs")
     parser.add_argument("--grad_clip", type=float, default=1.0, help="Gradient clipping value")
     parser.add_argument("--resume_checkpoint", type=str, default=None, help="Path to checkpoint to resume from")
+    parser.add_argument("--num_workers", type=int, default=4, help="Number of data loader workers")
     args = parser.parse_args()
     
     os.makedirs(args.output_dir, exist_ok=True)
@@ -73,10 +74,16 @@ def main():
         import time
         import socket
         
-        def find_free_port():
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.bind(('', 0))
-                return s.getsockname()[1]
+        def find_free_port(start_port=6000):
+            port = start_port
+            while port < 65535:
+                try:
+                    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                        s.bind(('', port))
+                        return port
+                except OSError:
+                    port += 1
+            raise RuntimeError("No free ports found")
         
         logger.info("Launching TensorBoard...")
         tb_log_dir = os.path.join(args.output_dir, "logs")
@@ -88,8 +95,9 @@ def main():
             
         # Run in background
         try:
-            port = find_free_port()
-            subprocess.Popen([tb_executable, "--logdir", tb_log_dir, "--port", str(port)])
+            port = find_free_port(6000)
+            subprocess.Popen([tb_executable, "--logdir", tb_log_dir, "--port", str(port), "--bind_all"])
+
             time.sleep(2) # Give it a sec
             logger.info(f"TensorBoard launched at http://localhost:{port}")
         except FileNotFoundError:
@@ -123,8 +131,8 @@ def main():
     # Initialize DataLoaders
     # num_workers is CRITICAL here. The CPU generates data while GPU trains.
     # set num_workers > 0 (e.g., 4 or 8) to parallelize generation.
-    train_loader = DataLoader(dataset, batch_size=1, shuffle=True, collate_fn=collate_fn, num_workers=4)
-    val_loader = DataLoader(val_dataset, batch_size=1, shuffle=False, collate_fn=collate_fn, num_workers=2)
+    train_loader = DataLoader(dataset, batch_size=1, shuffle=True, collate_fn=collate_fn, num_workers=args.num_workers)
+    val_loader = DataLoader(val_dataset, batch_size=1, shuffle=False, collate_fn=collate_fn, num_workers=args.num_workers)
     
     # 2. Model
     # Initialize the Causal Transformer
