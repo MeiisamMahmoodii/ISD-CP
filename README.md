@@ -1,4 +1,4 @@
-# Structure-Agnostic Causal Transformer (ISD-CP)
+# Implicit Structure Discovery - Causal Prediction (ISD-CP)
 
 ![Python](https://img.shields.io/badge/python-3.8%2B-blue)
 ![PyTorch](https://img.shields.io/badge/PyTorch-2.0%2B-orange)
@@ -73,7 +73,13 @@ This project has evolved through several phases of research and engineering. Her
 
 ## 🏗️ Detailed Architecture
 
-ISD-CP utilizes a modified Transformer Encoder architecture optimized for tabular data.
+### 1. Core Components
+*   **Type**: Transformer Encoder (BERT-style).
+*   **Layers**: 8
+*   **Heads**: 8
+*   **Embedding Dimension ($d_{model}$)**: 256
+*   **Feed-Forward Dimension**: 2048
+*   **Dropout**: 0.1
 
 ```mermaid
 graph TD
@@ -100,32 +106,37 @@ graph TD
     LN_Final --> MLP
 ```
 
-### 1. TabICL-Style Interleaved Encoder
-Instead of summing embeddings, we now treat the table as a sequence of tokens, similar to how LLMs process text.
--   **Sequence**: `[F1, V1, F2, V2, ..., Fn, Vn]` (Length $2N$).
--   **Feature Token ($F_i$)**: Represents the *identity* of the variable (e.g., "Column 1").
--   **Value Token ($V_i$)**: Represents the *state* of the variable (Value + Type).
-    -   **Value Embedding**: TabPFN-style MLP for scalar values.
-    -   **Type Embedding**: Learned embedding for "Observed" vs "Intervened".
+### 2. Input Representation (Interleaved Tokens)
+To handle the dual nature of Causal Models (Structure + State), we represent each variable as a pair of tokens. For a system with variables $X_1, X_2, \dots, X_N$:
 
-### 2. The Delta Output Head
+$$ \text{Input Sequence} = [F_1, V_1, F_2, V_2, \dots, F_N, V_N] $$
+
+*   **Feature Token ($F_i$)**: Represents the *identity* of the variable.
+    *   Implemented via `nn.Embedding(num_vars, d_model)`.
+    *   Allows the model to learn structural properties (e.g., "Node 1 usually causes Node 5").
+*   **Value Token ($V_i$)**: Represents the *state* of the variable.
+    *   Implemented via a **TabPFN-style MLP** that projects a single float scalar into a vector.
+    *   Includes a **Type Embedding** to indicate if the variable is *Observed* (0) or *Intervened* (1).
+
+**Rationale**: Separating Identity ($F$) from Value ($V$) allows the Self-Attention mechanism to disentangle "Structure Learning" (attending to $F$) from "Mechanism Learning" (attending to $V$).
+
+### 3. The Delta Output Head
 The final layer projects the output of each **Value Token** to a scalar prediction.
--   **Input**: Output state of $V_i$ from the Transformer.
--   **Output**: $\hat{\delta}_i$ (Predicted change).
--   **Loss Function**: **HuberLoss** (Robust Regression).
-    -   $L = \text{Huber}(\hat{\delta} - \delta_{true})$.
-    -   Robust to outliers and prevents exploding gradients.
-
-### 3. Implicit Causal Mechanism
-We no longer explicitly reconstruct the DAG. Instead, the Transformer uses **Full Self-Attention** to learn the causal graph implicitly.
--   To predict the change in $V_j$, the model attends to all other Feature and Value tokens.
--   It learns to attend to "Causes" ($V_i$) to predict "Effects" ($V_j$).
+*   **Target**: A vector of deltas $\Delta \mathbf{X} \in \mathbb{R}^N$.
+*   **Prediction**: The model outputs a vector of size $N$, where the $i$-th element represents the predicted change in variable $X_i$.
+*   **Loss Function**: **HuberLoss** (Robust Regression).
+    *   $L = \text{Huber}(\hat{\delta} - \delta_{true})$.
+    *   Robust to outliers and prevents exploding gradients.
 
 ---
 
-## 🔄 Data Generation Pipeline
+## 🔄 Data Engineering
 
-We generate data **online** to ensure infinite variety.
+### 1. SCM Generation
+We generate synthetic Structural Causal Models (SCMs) to train the model.
+*   **Graph**: Random DAGs generated via Erdos-Renyi.
+*   **Mechanisms**: Mixed Linear and Non-Linear (MLP) functions.
+*   **Noise**: Gaussian noise with random variance.
 
 ```mermaid
 sequenceDiagram
@@ -143,6 +154,30 @@ sequenceDiagram
     D->>D: Standardize & Tokenize
     D-->>T: Tensor Batch
 ```
+
+### 2. Variable Sizing
+The model handles SCMs of varying sizes (e.g., 10 to 100 nodes) seamlessly.
+*   **Batch Size = 1**: We load one SCM at a time.
+*   **Internal Batching**: Each SCM contains multiple intervention samples (e.g., 100 samples). These are processed in parallel as a single tensor of shape `(100, N)`.
+*   **No Padding**: Since we don't mix different SCMs in the same forward pass, no padding is required.
+
+### 3. Identified Issue: Topological Bias
+**Problem**: The current generator enforces $i < j$ for edges (Node 0 can cause Node 10, but Node 10 cannot cause Node 0).
+**Risk**: The model might learn to ignore values and rely on ID order ("Higher IDs never cause Lower IDs").
+**Solution (Planned)**: Apply a random permutation to the columns of the data matrix before feeding it to the model. This breaks the correlation between ID and topological position.
+
+---
+
+## ⚖️ Comparison with Do-PFN
+
+| Feature | Do-PFN | ISD-CP (Our Model) |
+| :--- | :--- | :--- |
+| **Primary Goal** | Estimate $P(Y \mid do(T))$ | Predict $\Delta \mathbf{X}$ (Global State Change) |
+| **Scope** | Single Target Variable | All Variables (System-Wide) |
+| **Output** | Probability Distribution | Deterministic Vector of Deltas |
+| **Use Case** | Precise Treatment Effect Estimation | Side-Effect Discovery & System Simulation |
+
+**Innovation**: Our "Structure-Agnostic Global Prediction" treats the SCM as a holistic object, allowing for the discovery of unintended side effects across the entire network in a single forward pass.
 
 ---
 

@@ -27,7 +27,7 @@ class TabPFNStyleEmbedding(nn.Module):
 
 class CausalTransformer(nn.Module):
     """
-    Structure-Agnostic Causal Transformer (ISD-CP) with TabICL-style Encoder.
+    Implicit Structure Discovery - Causal Prediction (ISD-CP) with TabICL-style Encoder.
     
     This model uses an interleaved sequence of Feature and Value tokens:
     [Feature1, Value1, Feature2, Value2, ...]
