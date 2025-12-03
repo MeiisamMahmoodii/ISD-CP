@@ -3,7 +3,7 @@
 ![Python](https://img.shields.io/badge/python-3.8%2B-blue)
 ![PyTorch](https://img.shields.io/badge/PyTorch-2.0%2B-orange)
 ![License](https://img.shields.io/badge/license-MIT-green)
-![Status](https://img.shields.io/badge/status-Development-brightgreen)
+![Status](https://img.shields.io/badge/status-Development-brightred)
 
 **ISD-CP** (**I**mplicit **S**tructure **D**iscovery - **C**ausal **P**rediction) is a cutting-edge, scalable Transformer model designed to revolutionize how we predict the consequences of interventions on tabular data.
 
