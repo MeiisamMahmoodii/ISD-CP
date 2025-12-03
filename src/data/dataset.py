@@ -57,7 +57,7 @@ def collate_fn(batch):
     For now, we just return the batch as is (a list of lists), and the Trainer 
     handles the iteration.
     """
-    return torch.utils.data.dataloader.default_collate(batch)
+    return batch[0]
 
 class OnlineCausalDataset(Dataset):
     """
@@ -166,10 +166,10 @@ class OnlineCausalDataset(Dataset):
             
             batch_data = {
                 'x': inp['x'],
-                'mask': inp['mask'],
-                'value': inp['value'],
+                'mask': inp['mask'].clone(),
+                'value': inp['value'].clone(),
                 'target': target,
-                'adj': adj # Add ground truth adjacency
+                'adj': adj.clone() # Add ground truth adjacency (cloned to avoid shared memory issues)
             }
             processed_data.append(batch_data)
             

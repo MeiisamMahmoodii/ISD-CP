@@ -5,11 +5,9 @@
 ![License](https://img.shields.io/badge/license-MIT-green)
 ![Status](https://img.shields.io/badge/status-Production-brightgreen)
 
-## 🌟 Overview
+**ISD-CP** (**I**mplicit **S**tructure **D**iscovery - **C**ausal **P**rediction) is a cutting-edge, scalable Transformer model designed to revolutionize how we predict the consequences of interventions on tabular data.
 
-**ISD-CP** (Implicit Structure Discovery - Causal Prediction) is a cutting-edge, scalable Transformer model designed to revolutionize how we predict the consequences of interventions on tabular data.
-
-Unlike traditional Causal Bayesian Networks that rely on explicit, often brittle, DAG discovery algorithms (like PC or GES), ISD-CP treats causal inference as an **end-to-end regression problem**. By leveraging the self-attention mechanism of Transformers, it implicitly learns the complex, non-linear causal dependencies between variables directly from data, without ever needing a graph as input.
+Unlike traditional Causal Bayesian Networks that rely on explicit, often brittle, DAG discovery algorithms (like PC or GES), ISD-CP treats causal inference as an **end-to-end regression problem**. By leveraging the self-attention mechanism of Transformers, it **implicitly discovers** the complex, non-linear causal dependencies between variables directly from data to make accurate **causal predictions**, without ever needing a graph as input.
 
 ### Why ISD-CP?
 *   **Structure-Agnostic**: No need for prior knowledge of the causal graph.

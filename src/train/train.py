@@ -8,6 +8,10 @@ from src.utils.monitor import log_gpu_usage
 import os
 import logging
 import sys
+import json
+from rich.console import Console
+from rich.table import Table
+from rich.panel import Panel
 
 # Fix for tmux/multiprocessing crash
 # This resolves "RuntimeError: received 0 items of ancdata" when running in tmux
@@ -57,6 +61,7 @@ def main():
     parser.add_argument("--grad_clip", type=float, default=1.0, help="Gradient clipping value")
     parser.add_argument("--resume_checkpoint", type=str, default=None, help="Path to checkpoint to resume from")
     parser.add_argument("--num_workers", type=int, default=4, help="Number of data loader workers")
+    parser.add_argument("--loss_function", type=str, default="huber", choices=["huber", "causal_focus"], help="Loss function to use")
     args = parser.parse_args()
     
     os.makedirs(args.output_dir, exist_ok=True)
@@ -131,8 +136,8 @@ def main():
     # Initialize DataLoaders
     # num_workers is CRITICAL here. The CPU generates data while GPU trains.
     # set num_workers > 0 (e.g., 4 or 8) to parallelize generation.
-    train_loader = DataLoader(dataset, batch_size=1, shuffle=True, collate_fn=collate_fn, num_workers=args.num_workers)
-    val_loader = DataLoader(val_dataset, batch_size=1, shuffle=False, collate_fn=collate_fn, num_workers=args.num_workers)
+    train_loader = DataLoader(dataset, batch_size=1, shuffle=True, collate_fn=collate_fn, num_workers=args.num_workers, pin_memory=True, prefetch_factor=2 if args.num_workers > 0 else None)
+    val_loader = DataLoader(val_dataset, batch_size=1, shuffle=False, collate_fn=collate_fn, num_workers=args.num_workers, pin_memory=True, prefetch_factor=2 if args.num_workers > 0 else None)
     
     # 2. Model
     # Initialize the Causal Transformer
@@ -175,45 +180,17 @@ def main():
         lambda_sparse=args.lambda_sparse,
         edge_threshold=args.edge_threshold,
         grad_clip=args.grad_clip,
-        epochs=args.epochs
+        epochs=args.epochs,
+        loss_fn_name=args.loss_function
     )
     
     # 5. Loop
     logger.info(f"Starting training on {trainer.device}...")
     log_gpu_usage()
     
-    best_f1 = -1.0
-    best_shd = float('inf')
+    trainer.fit()
 
-    for epoch in range(args.epochs):
-        # Update dataset epoch to generate new SCMs
-        # If reuse_factor > 1, we stay on the same "dataset epoch" for multiple training epochs
-        dataset.set_epoch(epoch // args.reuse_factor)
-        
-        loss = trainer.train_epoch(epoch)
-        val_loss, val_shd, val_f1 = trainer.validate(epoch)
-        
-        log_msg = f"Epoch {epoch+1}/{args.epochs} - Train Loss: {loss:.4f} - Val Loss: {val_loss:.4f} - SHD: {val_shd:.2f} - F1: {val_f1:.4f}"
-        logger.info(log_msg)
-        trainer.log_terminal_message(log_msg, epoch)
-        
-        # Save Last Checkpoint (Overwrite)
-        torch.save(model.state_dict(), os.path.join(args.output_dir, "model_last.pt"))
-        
-        # Save Best Checkpoint (Based on F1, then SHD)
-        is_best = False
-        if val_f1 > best_f1:
-            is_best = True
-        elif val_f1 == best_f1 and val_shd < best_shd:
-            is_best = True
-            
-        if is_best:
-            best_f1 = val_f1
-            best_shd = val_shd
-            torch.save(model.state_dict(), os.path.join(args.output_dir, "model_best.pt"))
-            logger.info(f"New Best Model! F1: {best_f1:.4f}, SHD: {best_shd:.2f}")
-            
-        logger.info(f"Saved checkpoint: model_last.pt")
+
 
 if __name__ == "__main__":
     main()
