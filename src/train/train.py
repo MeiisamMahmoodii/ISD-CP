@@ -61,7 +61,7 @@ def main():
     parser.add_argument("--grad_clip", type=float, default=1.0, help="Gradient clipping value")
     parser.add_argument("--resume_checkpoint", type=str, default=None, help="Path to checkpoint to resume from")
     parser.add_argument("--num_workers", type=int, default=4, help="Number of data loader workers")
-    parser.add_argument("--loss_function", type=str, default="huber", choices=["huber", "causal_focus"], help="Loss function to use")
+    parser.add_argument("--loss_function", type=str, default="huber", choices=["huber", "causal_focus", "three_tier"], help="Loss function to use")
     args = parser.parse_args()
     
     os.makedirs(args.output_dir, exist_ok=True)

@@ -31,11 +31,12 @@ class CausalFocusLoss(nn.Module):
         self.focus_weight = focus_weight
         self.huber = nn.HuberLoss(reduction='none', delta=delta)
 
-    def forward(self, pred, target, mask):
+    def forward(self, pred, target, mask, adj=None):
         """
         pred:   (Batch, N)
         target: (Batch, N)
         mask:   (Batch, N) -> 1.0 for intervened node, 0.0 for others
+        adj:    Ignored (compatibility)
         """
         # 1. Calculate standard element-wise loss
         raw_loss = self.huber(pred, target)
@@ -46,6 +47,91 @@ class CausalFocusLoss(nn.Module):
         weights = 1.0 + (self.focus_weight - 1.0) * mask
         
         # 3. Apply weights
+        weighted_loss = (raw_loss * weights).mean()
+        
+        return weighted_loss
+
+class ThreeTierCausalLoss(nn.Module):
+    def __init__(self, w_cause=10.0, w_effect=5.0, w_noise=1.0, delta=1.0):
+        super().__init__()
+        self.w_cause = w_cause
+        self.w_effect = w_effect
+        self.w_noise = w_noise
+        self.huber = nn.HuberLoss(reduction='none', delta=delta)
+
+    def get_descendants(self, adj, mask):
+        """
+        Identifies descendants of the intervened nodes.
+        adj: (N, N) - Adjacency matrix (1 if i->j)
+        mask: (Batch, N) - 1 if intervened
+        Returns: (Batch, N) - 1 if descendant
+        """
+        # Compute Reachability Matrix R = (I + A)^N
+        # Since N is small (<100), we can just use matrix power or transitive closure.
+        # For efficiency, we can cache this if adj is constant, but here it changes per SCM.
+        # A simple way for small N is to use torch.matrix_power or repeated multiplication.
+        
+        N = adj.shape[0]
+        # Binarize adj just in case
+        A = (adj > 0).float()
+        
+        # Reachability: (I + A)^(N)
+        # We can do this iteratively: R_{k+1} = R_k @ A + I
+        # Or just use the fact that (I+A)^N covers all paths.
+        
+        # Optimization: Since we only care about descendants of the *masked* nodes,
+        # we can propagate the mask: mask_{t+1} = mask_t @ A
+        
+        # Current active nodes (Batch, N)
+        current = mask.float()
+        descendants = torch.zeros_like(mask)
+        
+        # Propagate N times (max depth)
+        # This is O(N * Batch * N^2) = O(B*N^3) which is fine for N=100, B=100
+        # Wait, B*N^2 matrix mult.
+        for _ in range(N):
+            # Propagate: new_active = current @ A
+            # (Batch, N) @ (N, N) -> (Batch, N)
+            next_step = current @ A
+            
+            # Add to descendants
+            descendants = descendants + next_step
+            
+            # Update current for next step
+            current = next_step
+            
+            # Early stop if no new nodes
+            if current.sum() == 0:
+                break
+                
+        return (descendants > 0).float()
+
+    def forward(self, pred, target, mask, adj):
+        """
+        pred:   (Batch, N)
+        target: (Batch, N)
+        mask:   (Batch, N) -> 1.0 for intervened node (Cause)
+        adj:    (N, N) -> Adjacency Matrix
+        """
+        # 1. Identify Tiers
+        cause_mask = mask
+        
+        # Effect Mask: Descendants of Cause, EXCLUDING the Cause itself
+        # (get_descendants might include self-loops if A has them, but DAGs don't)
+        # We ensure strict separation.
+        descendants = self.get_descendants(adj, mask)
+        effect_mask = descendants * (1 - cause_mask)
+        
+        # Noise Mask: Everything else
+        noise_mask = 1.0 - cause_mask - effect_mask
+        
+        # 2. Calculate Weights
+        weights = (self.w_cause * cause_mask) + \
+                  (self.w_effect * effect_mask) + \
+                  (self.w_noise * noise_mask)
+                  
+        # 3. Calculate Loss
+        raw_loss = self.huber(pred, target)
         weighted_loss = (raw_loss * weights).mean()
         
         return weighted_loss
@@ -89,12 +175,12 @@ class Trainer:
         if loss_fn_name == "causal_focus":
             self.criterion = CausalFocusLoss(focus_weight=10.0, delta=1.0)
             print("Using CausalFocusLoss (weight=10.0)")
+        elif loss_fn_name == "three_tier":
+            self.criterion = ThreeTierCausalLoss(w_cause=10.0, w_effect=5.0, w_noise=1.0)
+            print("Using ThreeTierCausalLoss (Cause=10, Effect=5, Noise=1)")
         else:
             self.criterion = nn.HuberLoss(delta=1.0)
             print("Using Standard HuberLoss")
-            self.criterion = nn.HuberLoss(delta=1.0)
-            print("Using Standard HuberLoss")
-        self.writer = SummaryWriter(log_dir=log_dir)
         self.writer = SummaryWriter(log_dir=log_dir)
         self.global_step = 0
         self.console = Console()
@@ -442,6 +528,7 @@ class Trainer:
                     mask = mini_batch['mask'].to(self.device)
                     value = mini_batch['value'].to(self.device)
                     target = mini_batch['target'].to(self.device)
+                    adj = mini_batch['adj'].to(self.device)
                     
                     if x.ndim == 3 and x.shape[0] == 1:
                         x = x.squeeze(0)
@@ -466,11 +553,11 @@ class Trainer:
                         value_micro = value[start_idx:end_idx]
                         target_micro = target[start_idx:end_idx]
                         
-                        pred_delta, adj = self.model(x_micro, mask_micro, value_micro)
+                        pred_delta, _ = self.model(x_micro, mask_micro, value_micro)
                         target_delta = target_micro - x_micro
                         
-                        if isinstance(self.criterion, CausalFocusLoss):
-                            loss_pred = self.criterion(pred_delta, target_delta, mask_micro)
+                        if isinstance(self.criterion, (CausalFocusLoss, ThreeTierCausalLoss)):
+                            loss_pred = self.criterion(pred_delta, target_delta, mask_micro, adj)
                         else:
                             loss_pred = self.criterion(pred_delta, target_delta)
                         
@@ -605,6 +692,7 @@ class Trainer:
                     mask = mini_batch['mask'].to(self.device)
                     value = mini_batch['value'].to(self.device)
                     target = mini_batch['target'].to(self.device)
+                    adj = mini_batch['adj'].to(self.device)
                     
                     if x.ndim == 3 and x.shape[0] == 1:
                         x = x.squeeze(0)
@@ -612,13 +700,13 @@ class Trainer:
                         value = value.squeeze(0)
                         target = target.squeeze(0)
                     
-                    pred_delta, adj = self.model(x, mask, value)
+                    pred_delta, _ = self.model(x, mask, value)
                     
                     # Compute Delta Target
                     target_delta = target - x
                     
-                    if isinstance(self.criterion, CausalFocusLoss):
-                         loss = self.criterion(pred_delta, target_delta, mask)
+                    if isinstance(self.criterion, (CausalFocusLoss, ThreeTierCausalLoss)):
+                         loss = self.criterion(pred_delta, target_delta, mask, adj)
                     else:
                          loss = self.criterion(pred_delta, target_delta)
                          

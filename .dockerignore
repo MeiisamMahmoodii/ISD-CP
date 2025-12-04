@@ -1,0 +1,29 @@
+# Git
+.git
+.gitignore
+
+# Python
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Checkpoints and Logs (Don't copy huge model files)
+checkpoints/
+checkpoints_*/
+logs/
+*.tfevents.*
+
+# IDEs
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+*.tar
+*.tar.gz
